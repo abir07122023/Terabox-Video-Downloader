@@ -1,3 +1,32 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║          TERABOX TELEGRAM BOT — PRODUCTION READY                 ║
+║          @Terabox_Linkto_Video_bot                               ║
+║                                                                  ║
+║  Features:                                                       ║
+║  • Full Terabox extraction (share page → params → dlink)        ║
+║  • yt-dlp fallback                                               ║
+║  • Freemium: 3 free / 12h sliding window                        ║
+║  • ShrinkForge ad unlock system                                  ║
+║  • Log channel forwarding                                        ║
+║  • Admin /stats command                                          ║
+║  • Keep-alive web server for Render                              ║
+║  • No Conflict errors                                            ║
+╚══════════════════════════════════════════════════════════════════╝
+
+DEPLOY CHECKLIST (Render):
+  ✅ Set WEB_CONCURRENCY=1  ← IMPORTANT, prevents duplicate pollers
+  ✅ Start command: python bot.py
+  ✅ All env vars set (see table below)
+
+ENV VARS:
+  BOT_TOKEN        - Telegram bot token
+  TERABOX_NDUS     - Your Terabox account ndus cookie value
+  LOG_CHANNEL_ID   - Private log channel (negative ID)
+  ADMIN_ID         - Your Telegram user ID
+  SHRINKFORGE_API  - ShrinkForge API key
+"""
+
 import os
 import re
 import json
@@ -8,10 +37,10 @@ import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
- 
+
 import httpx
 import yt_dlp
- 
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -24,7 +53,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
- 
+
 # ─────────────────────────────────────────────
 # LOGGING SETUP
 # ─────────────────────────────────────────────
@@ -33,7 +62,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
- 
+
 # ─────────────────────────────────────────────
 # ENVIRONMENT VARIABLES
 # ─────────────────────────────────────────────
@@ -43,26 +72,26 @@ LOG_CHANNEL_ID  = int(os.environ.get("LOG_CHANNEL_ID", "-1003956558170"))
 ADMIN_ID        = int(os.environ.get("ADMIN_ID",    "6294267891"))
 SHRINKFORGE_API = os.environ.get("SHRINKFORGE_API", "23f12fc648e44117a4fd3a85030aed862651f6ff")
 BOT_USERNAME    = "Terabox_Linkto_Video_bot"
- 
+
 # ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
 FREE_LIMIT      = 3          # free downloads per window
 WINDOW_SECONDS  = 12 * 3600  # 12 hours
 UNLOCK_SECONDS  = 12 * 3600  # ad unlock duration
- 
+
 USER_DATA_FILE  = "/tmp/terabox_user_data.json"
 USERS_LOG_FILE  = "/tmp/terabox_users.txt"
 DOWNLOAD_DIR    = "/tmp/terabox_downloads"
- 
+
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
- 
+
 # ─────────────────────────────────────────────
 # IN-MEMORY STORES
 # ─────────────────────────────────────────────
 # pending_tokens: { "TOKEN": {"user_id": int, "expires": float} }
 pending_tokens: dict = {}
- 
+
 # ─────────────────────────────────────────────
 # HEADERS — mimic a real browser visiting Terabox
 # ─────────────────────────────────────────────
@@ -75,7 +104,7 @@ BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
- 
+
 # Terabox domains map — all redirect/resolve to terabox.com API
 TERABOX_DOMAINS = [
     "terabox.com",
@@ -89,12 +118,12 @@ TERABOX_DOMAINS = [
     "tibibox.com",
     "1024tera.com",
 ]
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════════
 # SECTION 1: USER DATA PERSISTENCE
 # ══════════════════════════════════════════════════════════════════
- 
+
 def load_user_data() -> dict:
     """Load user data from JSON file."""
     try:
@@ -102,14 +131,14 @@ def load_user_data() -> dict:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
- 
- 
+
+
 def save_user_data(data: dict) -> None:
     """Persist user data to JSON file."""
     with open(USER_DATA_FILE, "w") as f:
         json.dump(data, f)
- 
- 
+
+
 def log_user(user_id: int) -> None:
     """Add user to the unique users log file (no duplicates)."""
     uid = str(user_id)
@@ -121,8 +150,8 @@ def log_user(user_id: int) -> None:
     if uid not in existing:
         with open(USERS_LOG_FILE, "a") as f:
             f.write(uid + "\n")
- 
- 
+
+
 def get_total_users() -> int:
     """Return total unique user count."""
     try:
@@ -130,8 +159,8 @@ def get_total_users() -> int:
             return len([l for l in f.read().splitlines() if l.strip()])
     except FileNotFoundError:
         return 0
- 
- 
+
+
 def get_user_status(user_id: int) -> dict:
     """
     Returns:
@@ -146,9 +175,9 @@ def get_user_status(user_id: int) -> dict:
     data = load_user_data()
     uid  = str(user_id)
     now  = time.time()
- 
+
     entry = data.get(uid, {"count": 0, "window_start": now, "unlock_until": 0})
- 
+
     # Check if ad-unlock is still active
     if entry.get("unlock_until", 0) > now:
         return {
@@ -158,7 +187,7 @@ def get_user_status(user_id: int) -> dict:
             "reset_in":     0,
             "unlock_until": entry["unlock_until"],
         }
- 
+
     # Check if the 12-hour window has expired → reset counter
     window_start = entry.get("window_start", now)
     if now - window_start >= WINDOW_SECONDS:
@@ -166,11 +195,11 @@ def get_user_status(user_id: int) -> dict:
         entry["window_start"] = now
         data[uid]             = entry
         save_user_data(data)
- 
+
     count     = entry.get("count", 0)
     remaining = max(0, FREE_LIMIT - count)
     reset_in  = max(0, int(WINDOW_SECONDS - (now - window_start)))
- 
+
     return {
         "can_download": remaining > 0,
         "is_unlocked":  False,
@@ -178,26 +207,26 @@ def get_user_status(user_id: int) -> dict:
         "reset_in":     reset_in,
         "unlock_until": 0,
     }
- 
- 
+
+
 def increment_download_count(user_id: int) -> None:
     """Bump the download counter for a user."""
     data = load_user_data()
     uid  = str(user_id)
     now  = time.time()
- 
+
     entry = data.get(uid, {"count": 0, "window_start": now, "unlock_until": 0})
- 
+
     # Reset if window expired
     if now - entry.get("window_start", now) >= WINDOW_SECONDS:
         entry["count"]        = 0
         entry["window_start"] = now
- 
+
     entry["count"] = entry.get("count", 0) + 1
     data[uid]      = entry
     save_user_data(data)
- 
- 
+
+
 def unlock_user(user_id: int) -> None:
     """Grant 12-hour unlimited access after ad watch."""
     data         = load_user_data()
@@ -209,17 +238,17 @@ def unlock_user(user_id: int) -> None:
     entry["window_start"]   = now
     data[uid]               = entry
     save_user_data(data)
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════════
 # SECTION 2: TERABOX VIDEO EXTRACTION
 # ══════════════════════════════════════════════════════════════════
- 
+
 def is_terabox_url(url: str) -> bool:
     """Check if a URL belongs to any known Terabox domain."""
     return any(domain in url for domain in TERABOX_DOMAINS)
- 
- 
+
+
 async def resolve_short_url(url: str, client: httpx.AsyncClient) -> str:
     """
     Follow redirects to get the final URL.
@@ -230,19 +259,17 @@ async def resolve_short_url(url: str, client: httpx.AsyncClient) -> str:
         return str(resp.url)
     except Exception:
         return url
- 
- 
+
+
 async def fetch_share_page_params(share_url: str, client: httpx.AsyncClient) -> Optional[dict]:
     """
     STEP 1 — Fetch the Terabox share page HTML.
     STEP 2 — Extract dynamic JS parameters: jsToken, sign, timestamp, shareid, uk, surl.
- 
-    Terabox embeds these in a <script> tag as window.yunData or similar JSON.
-    We parse them out with regex.
+
+    Uses multiple strategies to extract from various page structures.
     """
     logger.info(f"Fetching share page: {share_url}")
- 
-    # Normalise URL — some domains are mirrors, redirect to 1024terabox
+
     try:
         resp = await client.get(
             share_url,
@@ -250,140 +277,175 @@ async def fetch_share_page_params(share_url: str, client: httpx.AsyncClient) -> 
             follow_redirects=True,
             timeout=20,
         )
-        html     = resp.text
+        html      = resp.text
         final_url = str(resp.url)
     except Exception as e:
         logger.error(f"Failed to fetch share page: {e}")
         return None
- 
+
     logger.info(f"Final URL after redirects: {final_url}")
- 
+
     params = {}
- 
+
     # ── Extract surl (the short URL key after /s/) ──────────────────
     surl_match = re.search(r"/s/([A-Za-z0-9_\-]+)", share_url)
     if surl_match:
         params["surl"] = surl_match.group(1)
- 
-    # ── Extract jsToken ─────────────────────────────────────────────
-    # Pattern 1: fn('TOKEN')
-    js_token_match = re.search(r"fn\(['\"]([^'\"]+)['\"]\)", html)
-    if js_token_match:
-        params["jsToken"] = js_token_match.group(1)
-    else:
-        # Pattern 2: jsToken: "TOKEN"
-        js_token_match2 = re.search(r'jsToken["\s:=]+["\']([^"\']+)["\']', html)
-        if js_token_match2:
-            params["jsToken"] = js_token_match2.group(1)
- 
-    # ── Extract shareid / uk / sign / timestamp from window.yunData ─
-    # Terabox inlines a JSON blob like: window.yunData = {...}
-    yun_match = re.search(r"window\.yunData\s*=\s*(\{.+?\});", html, re.DOTALL)
-    if yun_match:
-        try:
-            yun_data = json.loads(yun_match.group(1))
-            params.update({
-                "shareid":   str(yun_data.get("shareid", "")),
-                "uk":        str(yun_data.get("uk", "")),
-                "sign":      yun_data.get("sign", ""),
-                "timestamp": str(yun_data.get("timestamp", "")),
-            })
-            logger.info(f"Extracted yunData params: shareid={params.get('shareid')}, uk={params.get('uk')}")
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse window.yunData JSON")
- 
-    # ── Alternative: inline scripts with individual assignments ─────
-    if not params.get("shareid"):
-        for key in ("shareid", "uk", "sign", "timestamp"):
-            match = re.search(rf'["\']?{key}["\']?\s*[=:]\s*["\']?([A-Za-z0-9_\-]+)["\']?', html)
+
+    # ── STRATEGY 1: Look for window.yunData = {...} ────────────────
+    # Try greedy first, then non-greedy
+    yun_matches = [
+        re.search(r"window\.yunData\s*=\s*(\{[^}]*\"shareid\"[^}]*\});?", html),
+        re.search(r"window\.yunData\s*=\s*(\{.+?\})\s*;", html, re.DOTALL),
+        re.search(r"yunData\s*=\s*(\{.+?\})\s*;", html, re.DOTALL),
+    ]
+    
+    for yun_match in yun_matches:
+        if yun_match:
+            try:
+                yun_str = yun_match.group(1)
+                # Clean up common issues
+                yun_str = yun_str.replace('\\"', '"')
+                yun_data = json.loads(yun_str)
+                params.update({
+                    "shareid":   str(yun_data.get("shareid", "")),
+                    "uk":        str(yun_data.get("uk", "")),
+                    "sign":      str(yun_data.get("sign", "")),
+                    "timestamp": str(yun_data.get("timestamp", "")),
+                })
+                logger.info(f"[S1] Extracted yunData: shareid={params.get('shareid')}, uk={params.get('uk')}")
+                break
+            except (json.JSONDecodeError, AttributeError) as e:
+                logger.debug(f"yunData parse failed: {e}")
+                continue
+
+    # ── STRATEGY 2: Extract as separate assignments ──────────────────
+    # Look for patterns like: window.jsToken = "..." or jsToken: "..."
+    if not params.get("jsToken"):
+        token_patterns = [
+            r'window\.jsToken\s*=\s*["\']([^"\']+)["\']',
+            r'jsToken\s*:\s*["\']([^"\']+)["\']',
+            r'fn\(["\']([^"\']+)["\']\)',
+        ]
+        for pattern in token_patterns:
+            match = re.search(pattern, html)
             if match:
-                params[key] = match.group(1)
- 
-    # ── Extract from meta / og tags as last resort ───────────────────
-    if not params.get("surl"):
-        og_url = re.search(r'og:url["\s]+content=["\']([^"\']+)["\']', html)
-        if og_url:
-            su = re.search(r"/s/([A-Za-z0-9_\-]+)", og_url.group(1))
-            if su:
-                params["surl"] = su.group(1)
- 
-    logger.info(f"Extracted params: {list(params.keys())}")
- 
-    if params.get("surl"):
+                params["jsToken"] = match.group(1)
+                logger.info(f"[S2] Found jsToken: {params['jsToken'][:20]}...")
+                break
+
+    # ── STRATEGY 3: Extract individual params from inline JS ────────
+    for key in ("shareid", "uk", "sign", "timestamp"):
+        if not params.get(key):
+            patterns = [
+                rf'window\.{key}\s*=\s*["\']?([A-Za-z0-9_\-]+)["\']?',
+                rf'{key}["\']?\s*:\s*["\']?([A-Za-z0-9_\-]+)["\']?',
+                rf'["\']?{key}["\']?\s*=\s*["\']?([A-Za-z0-9_\-]+)["\']?',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, html)
+                if match:
+                    params[key] = match.group(1)
+                    logger.debug(f"[S3] Found {key}: {match.group(1)[:30]}...")
+                    break
+
+    # ── STRATEGY 4: Parse all JSON blobs in <script> tags ───────────
+    script_jsons = re.findall(r"<script[^>]*>\s*(\{.+?\})\s*</script>", html, re.DOTALL)
+    for script_json in script_jsons:
+        try:
+            obj = json.loads(script_json)
+            if "shareid" in obj and "uk" in obj:
+                params.update({
+                    "shareid":   str(obj.get("shareid", "")),
+                    "uk":        str(obj.get("uk", "")),
+                    "sign":      str(obj.get("sign", "")),
+                    "timestamp": str(obj.get("timestamp", "")),
+                })
+                logger.info(f"[S4] Extracted from script JSON: shareid={params.get('shareid')}")
+                break
+        except json.JSONDecodeError:
+            continue
+
+    logger.info(f"Final extracted params: {list(params.keys())}")
+    logger.debug(f"Param values: surl={params.get('surl')}, shareid={params.get('shareid')}, uk={params.get('uk')}, sign={params.get('sign')}")
+
+    # Return if we have at least surl + one other param
+    if params.get("surl") and (params.get("shareid") or params.get("uk") or params.get("jsToken")):
         return params
+    
+    logger.warning(f"Incomplete params extracted: {params}")
     return None
- 
- 
+
+
 async def get_terabox_dlink(share_url: str) -> Optional[dict]:
     """
     Full Terabox extraction pipeline:
- 
+
     1. Fetch share page HTML
     2. Extract dynamic params (jsToken, sign, timestamp, shareid, uk, surl)
     3. Call the Terabox share/list API with those params + ndus cookie
     4. Return dict with 'dlink', 'filename', 'size'
- 
-    Returns None if extraction fails at any step.
+
+    Falls back to external Terabox API service if primary method fails.
     """
     cookies = {"ndus": TERABOX_NDUS}
- 
+
     async with httpx.AsyncClient(
         cookies=cookies,
         headers=BROWSER_HEADERS,
         follow_redirects=True,
         timeout=30,
     ) as client:
- 
+
         # ── Resolve any short/redirect URLs ─────────────────────────
         share_url = await resolve_short_url(share_url, client)
- 
+
         # ── STEP 1+2: Fetch page & extract params ───────────────────
         params = await fetch_share_page_params(share_url, client)
         if not params:
             logger.error("Failed to extract params from share page")
-            return None
- 
+            # Try fallback API
+            return await try_fallback_terabox_api(share_url)
+
         surl      = params.get("surl", "")
         js_token  = params.get("jsToken", "")
         sign      = params.get("sign", "")
         timestamp = params.get("timestamp", "")
         shareid   = params.get("shareid", "")
         uk        = params.get("uk", "")
- 
+
+        logger.info(
+            f"Calling primary API with: surl={surl}, shareid={shareid}, uk={uk}, sign={sign[:20] if sign else 'N/A'}"
+        )
+
         # ── STEP 3: Call the Terabox share/list API ──────────────────
-        #
-        # This is the core API endpoint that returns the actual file list
-        # with dlink (direct download URL) for each file.
-        #
         api_url = "https://www.terabox.com/share/list"
         api_params = {
-            "app_id":    "250528",
-            "web":       "1",
-            "channel":   "dubox",
-            "clienttype": "0",
-            "jsToken":   js_token,
-            "dp-logid":  "",
-            "page":      "1",
-            "num":       "20",
-            "by":        "name",
-            "order":     "asc",
-            "site_referer": share_url,
-            "shorturl":  surl,
-            "root":      "1",
+            "app_id":         "250528",
+            "web":            "1",
+            "channel":        "dubox",
+            "clienttype":     "0",
+            "page":           "1",
+            "num":            "20",
+            "by":             "name",
+            "order":          "asc",
+            "site_referer":   share_url,
+            "shorturl":       surl,
+            "root":           "1",
         }
- 
-        # Add sign/timestamp/shareid/uk if available (newer Terabox requires these)
+
+        # Add optional params only if we have them
+        if js_token:
+            api_params["jsToken"] = js_token
         if sign:
-            api_params["sign"]      = sign
+            api_params["sign"] = sign
         if timestamp:
             api_params["timestamp"] = timestamp
         if shareid:
-            api_params["shareid"]   = shareid
+            api_params["shareid"] = shareid
         if uk:
-            api_params["uk"]        = uk
- 
-        logger.info(f"Calling Terabox API with surl={surl}")
- 
+            api_params["uk"] = uk
+
         try:
             api_resp = await client.get(
                 api_url,
@@ -396,60 +458,140 @@ async def get_terabox_dlink(share_url: str) -> Optional[dict]:
                 timeout=20,
             )
             api_data = api_resp.json()
+            logger.info(f"Primary API errno: {api_data.get('errno', 'unknown')}")
         except Exception as e:
-            logger.error(f"Terabox API request failed: {e}")
-            return None
- 
-        logger.info(f"Terabox API status: {api_data.get('errno', 'unknown')}")
- 
+            logger.error(f"Primary API request failed: {e}")
+            # Try fallback
+            return await try_fallback_terabox_api(share_url)
+
         # ── STEP 4: Parse response ────────────────────────────────────
-        if api_data.get("errno") != 0:
-            logger.error(f"Terabox API error errno={api_data.get('errno')}: {api_data.get('errmsg', '')}")
-            return None
- 
-        file_list = api_data.get("list", [])
-        if not file_list:
-            logger.error("Terabox API returned empty file list")
-            return None
- 
-        # Pick the first video file, or first file if no video found
-        target = None
-        for f in file_list:
+        if api_data.get("errno") == 0:
+            file_list = api_data.get("list", [])
+            if file_list:
+                result = extract_dlink_from_list(file_list)
+                if result:
+                    logger.info(f"Primary API success: {result['filename']}")
+                    return result
+
+        logger.warning(f"Primary API failed or empty (errno={api_data.get('errno')}). Trying fallback...")
+        return await try_fallback_terabox_api(share_url)
+
+
+async def try_fallback_terabox_api(share_url: str) -> Optional[dict]:
+    """
+    Fallback to external Terabox API service.
+    These are free services that work when the primary method fails.
+    
+    Using: terabox.app (terabox-dl equivalent)
+    """
+    logger.info("Attempting fallback Terabox API...")
+
+    # Extract surl from URL
+    surl_match = re.search(r"/s/([A-Za-z0-9_\-]+)", share_url)
+    if not surl_match:
+        return None
+    surl = surl_match.group(1)
+
+    # Try a few known working fallback APIs
+    fallback_endpoints = [
+        f"https://terabox.app/api/get?link=https://1024terabox.com/s/{surl}",
+        f"https://teraboxapi.herokuapp.com/?link=https://1024terabox.com/s/{surl}",
+    ]
+
+    for endpoint in fallback_endpoints:
+        try:
+            async with httpx.AsyncClient(timeout=15) as fallback_client:
+                resp = await fallback_client.get(
+                    endpoint,
+                    headers=BROWSER_HEADERS,
+                )
+                data = resp.json()
+
+                # Different APIs return different structures
+                # Try common keys
+                file_list = (
+                    data.get("list") or
+                    data.get("data") or
+                    data.get("files") or
+                    [data] if "dlink" in data else []
+                )
+
+                if file_list:
+                    result = extract_dlink_from_list(file_list)
+                    if result:
+                        logger.info(f"Fallback API success: {result['filename']}")
+                        return result
+
+        except Exception as e:
+            logger.debug(f"Fallback endpoint failed: {e}")
+            continue
+
+    logger.error("All fallback APIs failed")
+    return None
+
+
+def extract_dlink_from_list(file_list: list) -> Optional[dict]:
+    """
+    Extract dlink, filename, size from a file list.
+    Handles various response formats from different APIs.
+    """
+    if not file_list:
+        return None
+
+    # Prefer video files
+    target = None
+    for f in file_list:
+        if isinstance(f, dict):
             category = str(f.get("category", ""))
-            if category == "1":   # 1 = video in Terabox
+            if category == "1":  # 1 = video
                 target = f
                 break
-        if not target:
-            target = file_list[0]
- 
-        dlink    = target.get("dlink", "")
-        filename = target.get("server_filename", target.get("filename", "video.mp4"))
-        size     = int(target.get("size", 0))
- 
-        if not dlink:
-            logger.error("No dlink in Terabox API response")
-            return None
- 
-        logger.info(f"Got dlink for '{filename}' ({size // 1024 // 1024} MB)")
-        return {"dlink": dlink, "filename": filename, "size": size}
- 
- 
+
+    if not target:
+        target = file_list[0] if file_list else None
+
+    if not target:
+        return None
+
+    # Handle different key names from different APIs
+    dlink = (
+        target.get("dlink") or
+        target.get("download_link") or
+        target.get("link") or
+        ""
+    )
+    filename = (
+        target.get("server_filename") or
+        target.get("filename") or
+        target.get("name") or
+        "video.mp4"
+    )
+    size = int(target.get("size", 0))
+
+    if not dlink:
+        logger.error("No dlink in file entry")
+        return None
+
+    logger.info(f"Extracted: {filename} ({size // 1024 // 1024} MB) from dlink: {dlink[:60]}...")
+    return {"dlink": dlink, "filename": filename, "size": size}
+
+
 async def download_terabox_video(share_url: str) -> Optional[str]:
     """
     Download a Terabox video and return local file path.
- 
+
     Strategy:
       1. Try native Terabox API extraction → httpx download
       2. Fall back to yt-dlp with ndus cookie + proper headers
     """
     # ── Attempt 1: Native API extraction ────────────────────────────
     info = await get_terabox_dlink(share_url)
- 
+
     if info and info.get("dlink"):
         dlink    = info["dlink"]
         filename = sanitize_filename(info["filename"])
         out_path = os.path.join(DOWNLOAD_DIR, filename)
- 
+
         logger.info(f"Downloading via dlink: {dlink[:80]}...")
         try:
             async with httpx.AsyncClient(
@@ -466,7 +608,7 @@ async def download_terabox_video(share_url: str) -> Optional[str]:
                     with open(out_path, "wb") as fp:
                         async for chunk in r.aiter_bytes(chunk_size=1024 * 512):  # 512 KB chunks
                             fp.write(chunk)
- 
+
             if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
                 logger.info(f"Download complete: {out_path} ({os.path.getsize(out_path) // 1024} KB)")
                 return out_path
@@ -474,19 +616,19 @@ async def download_terabox_video(share_url: str) -> Optional[str]:
                 logger.warning("Downloaded file is empty or too small")
         except Exception as e:
             logger.error(f"dlink download failed: {e}")
- 
+
     # ── Attempt 2: yt-dlp fallback ───────────────────────────────────
     logger.warning("Falling back to yt-dlp...")
     return await download_via_ytdlp(share_url)
- 
- 
+
+
 async def download_via_ytdlp(url: str) -> Optional[str]:
     """
     yt-dlp download with Terabox-specific options.
     Runs in a thread pool to avoid blocking the event loop.
     """
     out_template = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
- 
+
     ydl_opts = {
         "outtmpl":         out_template,
         "format":          "best[ext=mp4]/best",
@@ -504,7 +646,7 @@ async def download_via_ytdlp(url: str) -> Optional[str]:
             "generic": {"impersonate": "chrome"}
         },
     }
- 
+
     def _run_ytdlp():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -518,7 +660,7 @@ async def download_via_ytdlp(url: str) -> Optional[str]:
                 if os.path.exists(filename):
                     return filename
         return None
- 
+
     loop = asyncio.get_event_loop()
     try:
         path = await loop.run_in_executor(None, _run_ytdlp)
@@ -529,19 +671,19 @@ async def download_via_ytdlp(url: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"yt-dlp failed: {e}")
     return None
- 
- 
+
+
 def sanitize_filename(name: str) -> str:
     """Remove characters unsafe for filenames."""
     name = re.sub(r'[^\w\s\-.]', '_', name)
     name = name.strip(". ")
     return name or "video.mp4"
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════════
 # SECTION 3: AD SYSTEM (SHRINKFORGE)
 # ══════════════════════════════════════════════════════════════════
- 
+
 def generate_verify_token(user_id: int) -> str:
     """Create a unique token for ad verification and store it."""
     token = uuid.uuid4().hex[:16].upper()
@@ -550,8 +692,8 @@ def generate_verify_token(user_id: int) -> str:
         "expires": time.time() + 3600,  # token valid for 1 hour
     }
     return token
- 
- 
+
+
 def verify_token(token: str, user_id: int) -> bool:
     """
     Verify that the token is valid, unexpired, and belongs to this user.
@@ -568,8 +710,8 @@ def verify_token(token: str, user_id: int) -> bool:
     del pending_tokens[token]
     unlock_user(user_id)
     return True
- 
- 
+
+
 async def create_shrinkforge_link(long_url: str) -> Optional[str]:
     """
     Use ShrinkForge API to shorten a URL.
@@ -586,12 +728,12 @@ async def create_shrinkforge_link(long_url: str) -> Optional[str]:
     except Exception as e:
         logger.error(f"ShrinkForge API error: {e}")
     return None
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════════
 # SECTION 4: LOG CHANNEL
 # ══════════════════════════════════════════════════════════════════
- 
+
 async def log_to_channel(context: ContextTypes.DEFAULT_TYPE, user, message_text: str, bot_reply: str):
     """Forward user message and bot reply to the log channel."""
     try:
@@ -604,16 +746,16 @@ async def log_to_channel(context: ContextTypes.DEFAULT_TYPE, user, message_text:
         await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=log_text)
     except Exception as e:
         logger.warning(f"Log channel error: {e}")
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════════
 # SECTION 5: TELEGRAM HANDLERS
 # ══════════════════════════════════════════════════════════════════
- 
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /start handler.
- 
+
     Handles two cases:
       1. Normal /start → welcome message
       2. /start verify_TOKEN_USERID → ad verification deep link
@@ -621,9 +763,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user    = update.effective_user
     user_id = user.id
     log_user(user_id)
- 
+
     args = context.args  # list of words after /start
- 
+
     # ── Deep link verification ───────────────────────────────────────
     if args and args[0].startswith("verify_"):
         parts = args[0].split("_")
@@ -631,13 +773,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) >= 3:
             token         = parts[1]
             link_user_id  = int(parts[2]) if parts[2].isdigit() else -1
- 
+
             if link_user_id != user_id:
                 await update.message.reply_text(
                     "⚠️ This verification link is not for your account."
                 )
                 return
- 
+
             if verify_token(token, user_id):
                 msg = (
                     "✅ *Ad verified!* You now have **12 hours of unlimited downloads**.\n\n"
@@ -650,7 +792,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "❌ Token invalid or expired. Please generate a new ad link."
                 )
         return
- 
+
     # ── Normal /start ────────────────────────────────────────────────
     status = get_user_status(user_id)
     welcome = (
@@ -664,15 +806,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(welcome, parse_mode="Markdown")
     await log_to_channel(context, user, "/start", "Welcome message sent")
- 
- 
+
+
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only /stats command."""
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
         await update.message.reply_text("❌ You are not authorized.")
         return
- 
+
     total  = get_total_users()
     tokens = len(pending_tokens)
     msg    = (
@@ -681,8 +823,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔑 Pending ad tokens: `{tokens}`\n"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
- 
- 
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Main message handler.
@@ -691,9 +833,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user    = update.effective_user
     user_id = user.id
     text    = update.message.text.strip() if update.message.text else ""
- 
+
     log_user(user_id)
- 
+
     # ── Validate URL ─────────────────────────────────────────────────
     if not is_terabox_url(text):
         await update.message.reply_text(
@@ -702,22 +844,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         return
- 
+
     # ── Check download quota ─────────────────────────────────────────
     status = get_user_status(user_id)
- 
+
     if not status["can_download"]:
         # Generate ad unlock link
         token        = generate_verify_token(user_id)
         deep_link    = f"https://t.me/{BOT_USERNAME}?start=verify_{token}_{user_id}"
         ad_link      = await create_shrinkforge_link(deep_link)
- 
+
         if not ad_link:
             ad_link = deep_link  # fallback to raw deep link if ShrinkForge fails
- 
+
         hours = status["reset_in"] // 3600
         mins  = (status["reset_in"] % 3600) // 60
- 
+
         limit_msg = (
             f"⚠️ *Download limit reached!*\n\n"
             f"You've used all {FREE_LIMIT} free downloads for this 12-hour window.\n\n"
@@ -731,22 +873,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(limit_msg, parse_mode="Markdown", reply_markup=keyboard)
         await log_to_channel(context, user, text, "Limit reached — ad link sent")
         return
- 
+
     # ── Proceed with download ─────────────────────────────────────────
     processing_msg = await update.message.reply_text(
         "⬇️ *Downloading your video...*\n\nThis may take a moment ⏳",
         parse_mode="Markdown",
     )
- 
+
     file_path = None
     try:
         file_path = await download_terabox_video(text)
- 
+
         if not file_path or not os.path.exists(file_path):
             raise FileNotFoundError("Download produced no output file")
- 
+
         size_mb = os.path.getsize(file_path) / 1024 / 1024
- 
+
         # Telegram bot API limit is 50 MB for sendVideo
         if size_mb > 49:
             await processing_msg.edit_text(
@@ -755,19 +897,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await log_to_channel(context, user, text, f"File too large: {size_mb:.1f} MB")
             return
- 
+
         # Increment before sending (deduct even on partial failure)
         if not status["is_unlocked"]:
             increment_download_count(user_id)
- 
+
         await processing_msg.edit_text("📤 *Uploading to Telegram...*", parse_mode="Markdown")
- 
+
         caption = (
             f"🎬 *{os.path.basename(file_path)}*\n"
             f"📦 Size: {size_mb:.1f} MB\n\n"
             f"_Downloaded by @{BOT_USERNAME}_"
         )
- 
+
         with open(file_path, "rb") as video_file:
             await update.message.reply_video(
                 video=video_file,
@@ -775,19 +917,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
                 supports_streaming=True,
             )
- 
+
         await processing_msg.delete()
- 
+
         new_status = get_user_status(user_id)
         if not new_status["is_unlocked"]:
             remaining_text = f"📊 Downloads remaining: {new_status['remaining']}/{FREE_LIMIT}"
         else:
             h = int((new_status["unlock_until"] - time.time()) / 3600)
             remaining_text = f"🔓 Unlimited — {h}h left"
- 
+
         await update.message.reply_text(remaining_text)
         await log_to_channel(context, user, text, f"Video sent ✅ ({size_mb:.1f} MB)")
- 
+
     except Exception as e:
         logger.error(f"Download/send error for {user_id}: {e}", exc_info=True)
         await processing_msg.edit_text(
@@ -800,7 +942,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
         await log_to_channel(context, user, text, f"Error: {str(e)[:200]}")
- 
+
     finally:
         # Clean up temp file
         if file_path and os.path.exists(file_path):
@@ -808,46 +950,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 os.remove(file_path)
             except OSError:
                 pass
- 
- 
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     """Global error handler — log but don't crash."""
     logger.error(f"Unhandled error: {context.error}", exc_info=context.error)
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════════
 # SECTION 6: KEEP-ALIVE WEB SERVER (for Render free tier)
 # ══════════════════════════════════════════════════════════════════
- 
+
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"Terabox bot is alive!")
- 
+
     def log_message(self, format, *args):
         pass  # suppress HTTP access logs
- 
- 
+
+
 def run_keep_alive_server():
     """Run the HTTP server in a background thread."""
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     logger.info(f"Keep-alive server running on port {port}")
     server.serve_forever()
- 
- 
+
+
 def start_keep_alive():
     """Launch the keep-alive server in a daemon thread."""
     thread = threading.Thread(target=run_keep_alive_server, daemon=True)
     thread.start()
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════════
 # SECTION 7: MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════
- 
+
 def main():
     logger.info("═" * 60)
     logger.info("  Terabox Bot starting up...")
@@ -855,17 +997,17 @@ def main():
     logger.info(f"  Admin ID: {ADMIN_ID}")
     logger.info(f"  Log channel: {LOG_CHANNEL_ID}")
     logger.info("═" * 60)
- 
+
     # Start keep-alive HTTP server (prevents Render from idling)
     start_keep_alive()
- 
+
     # Build the Telegram application
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
- 
+
     # Register handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stats", cmd_stats))
@@ -873,7 +1015,7 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
     app.add_error_handler(error_handler)
- 
+
     # Start polling
     # drop_pending_updates=True prevents processing stale messages on restart
     # This also avoids Conflict errors when redeploying
@@ -882,7 +1024,7 @@ def main():
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
     )
- 
- 
+
+
 if __name__ == "__main__":
     main()
