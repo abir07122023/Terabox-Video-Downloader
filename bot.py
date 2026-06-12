@@ -6,7 +6,9 @@ import time
 import asyncio
 import httpx
 import uuid
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 import yt_dlp
@@ -291,6 +293,19 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Download error: {e}")
             await status_msg.edit_text("❌ Failed to download. Link may be invalid or expired.")
 
+# ── Keep-Alive Web Server (Flask) ─────────────────────────────────────────
+app_flask = Flask(__name__)
+
+@app_flask.route('/')
+def health_check():
+    """Endpoint to keep the Render service alive."""
+    return "Bot is running!"
+
+def run_web_server():
+    """Starts the Flask web server in a separate thread."""
+    port = int(os.environ.get("PORT", 5000))
+    app_flask.run(host='0.0.0.0', port=port)
+
 # ── Main ──────────────────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
@@ -301,6 +316,12 @@ def main():
     if not SHRINKFORGE_API:
         logger.warning("SHRINKFORGE_API not set – ad system disabled")
 
+    # Start the keep-alive web server in a background thread
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+    logger.info("Keep-alive web server started on port " + os.environ.get("PORT", "5000"))
+
+    # Start the Telegram bot
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
