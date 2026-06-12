@@ -99,7 +99,7 @@ def can_use_free_video(user_id):
     count, _ = get_user_state(user_id)
     return count < 3
 
-# ── Download function (public API first, then yt-dlp fallback) ──────
+# ── Download function (API first, then yt-dlp fallback) ─────────────
 async def download_terabox(url, tmpdir):
     # Try public API (fast)
     try:
@@ -107,20 +107,22 @@ async def download_terabox(url, tmpdir):
             api_url = "https://terabox-worker.robinkumarshakya103.workers.dev/api"
             resp = await client.get(api_url, params={"url": url}, timeout=15)
             data = resp.json()
-            if data.get("ok") and data.get("download_url"):
-                dl_link = data["download_url"]
-                async with httpx.AsyncClient() as dl_client:
-                    dl_resp = await dl_client.get(dl_link, timeout=60)
-                    file_path = os.path.join(tmpdir, "video.mp4")
-                    with open(file_path, "wb") as f:
-                        f.write(dl_resp.content)
-                    size_mb = os.path.getsize(file_path) / 1024 / 1024
-                    return file_path, size_mb
+            # The API returns "success" key, not "ok"
+            if data.get("success") and data.get("files") and len(data["files"]) > 0:
+                dl_link = data["files"][0].get("download_url")
+                if dl_link:
+                    async with httpx.AsyncClient() as dl_client:
+                        dl_resp = await dl_client.get(dl_link, timeout=60)
+                        file_path = os.path.join(tmpdir, "video.mp4")
+                        with open(file_path, "wb") as f:
+                            f.write(dl_resp.content)
+                        size_mb = os.path.getsize(file_path) / 1024 / 1024
+                        return file_path, size_mb
     except Exception as e:
         logger.warning(f"Public API failed: {e}")
 
-    # Fallback: yt-dlp with cookie
-    cookie_content = f"# Netscape Cookie\n.terabox.com\tTRUE\t/\tTRUE\t0\tndus\t{TERABOX_NDUS}\n"
+    # Fallback: yt-dlp with ndus cookie
+    cookie_content = f"# Netscape HTTP Cookie File\n.terabox.com\tTRUE\t/\tTRUE\t0\tndus\t{TERABOX_NDUS}\n"
     cookie_path = '/tmp/terabox_cookies.txt'
     with open(cookie_path, 'w') as f:
         f.write(cookie_content)
@@ -129,8 +131,8 @@ async def download_terabox(url, tmpdir):
         'format': 'best',
         'quiet': False,
         'cookiefile': cookie_path,
+        'headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
     }
-    # Run yt-dlp in a thread to avoid blocking the event loop
     loop = asyncio.get_running_loop()
     def _sync_dl():
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -215,7 +217,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.from_user.username or "no_username"
     log_user(user_id, username)
 
-    # Support all common Terabox domains
+    # Support all Terabox domains
     if not any(domain in url for domain in ["terabox.com", "terabox.app", "1024terabox.com"]):
         return
 
@@ -286,7 +288,6 @@ def main():
     if not SHRINKFORGE_API:
         logger.warning("SHRINKFORGE_API not set – ad system disabled")
 
-    # Start keep-alive server
     thread = threading.Thread(target=run_keep_alive, daemon=True)
     thread.start()
     logger.info(f"Keep-alive server running on port {os.environ.get('PORT', '8000')}")
