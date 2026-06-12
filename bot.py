@@ -599,22 +599,22 @@ async def try_fallback_terabox_api(share_url: str) -> Optional[dict]:
     return None
 
 
+# ---------- FIXED extract_dlink_from_list ----------
 def extract_dlink_from_list(file_list: list) -> Optional[dict]:
     """
     Extract dlink, filename, size from a file list.
-    Handles various response formats from different APIs.
+    Handles various response formats and multiple possible key names.
+    Logs available keys for debugging.
     """
     if not file_list:
         return None
 
-    # Prefer video files
+    # Prefer video files (category 1)
     target = None
     for f in file_list:
-        if isinstance(f, dict):
-            category = str(f.get("category", ""))
-            if category == "1":  # 1 = video
-                target = f
-                break
+        if isinstance(f, dict) and str(f.get("category", "")) == "1":
+            target = f
+            break
 
     if not target:
         target = file_list[0] if file_list else None
@@ -622,27 +622,25 @@ def extract_dlink_from_list(file_list: list) -> Optional[dict]:
     if not target:
         return None
 
-    # Handle different key names from different APIs
-    dlink = (
-        target.get("dlink") or
-        target.get("download_link") or
-        target.get("link") or
-        ""
-    )
-    filename = (
-        target.get("server_filename") or
-        target.get("filename") or
-        target.get("name") or
-        "video.mp4"
-    )
-    size = int(target.get("size", 0))
+    # Log available keys for debugging
+    logger.info(f"Available keys in file entry: {list(target.keys())}")
 
-    if not dlink:
-        logger.error("No dlink in file entry")
-        return None
+    # Try all possible download link keys
+    possible_keys = ["dlink", "download_url", "direct_link", "link", "url", "download_link"]
+    for key in possible_keys:
+        dlink = target.get(key)
+        if dlink and isinstance(dlink, str):
+            # Handle relative URLs
+            if dlink.startswith("/"):
+                dlink = "https://www.terabox.com" + dlink
+            if dlink.startswith("http"):
+                filename = target.get("server_filename") or target.get("filename") or "video.mp4"
+                size = int(target.get("size", 0))
+                logger.info(f"Found download link using key '{key}': {dlink[:80]}...")
+                return {"dlink": dlink, "filename": filename, "size": size}
 
-    logger.info(f"Extracted: {filename} ({size // 1024 // 1024} MB) from dlink: {dlink[:60]}...")
-    return {"dlink": dlink, "filename": filename, "size": size}
+    logger.error("No download link found in file entry")
+    return None
 
 
 async def download_terabox_video(share_url: str) -> Optional[str]:
