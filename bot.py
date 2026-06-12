@@ -12,7 +12,6 @@ from concurrent.futures import ThreadPoolExecutor
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import yt_dlp
-from terabox_downloader import TeraboxDownloader
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -100,31 +99,40 @@ def can_use_free_video(user_id):
     count, _ = get_user_state(user_id)
     return count < 3
 
-# ── Terabox download using terabox-downloader + yt-dlp fallback ──────
+# ── Download function (API with referer + yt-dlp fallback) ──────────
 async def download_terabox(url, tmpdir):
-    # 1. Try the robust terabox-downloader package
+    # 1. Try public API with improved headers
     try:
-        # The package expects ndus cookie as a string
-        downloader = TeraboxDownloader(cookie=TERABOX_NDUS)
-        # Get download link
-        result = downloader.get_download_link(url)
-        if result and 'direct_link' in result:
-            dl_link = result['direct_link']
-            logger.info(f"Got download link from terabox-downloader: {dl_link}")
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(dl_link, timeout=90)
-                if resp.status_code == 200:
-                    file_path = os.path.join(tmpdir, "video.mp4")
-                    with open(file_path, "wb") as f:
-                        f.write(resp.content)
-                    size_mb = os.path.getsize(file_path) / 1024 / 1024
-                    return file_path, size_mb
-                else:
-                    logger.warning(f"Download link returned {resp.status_code}")
+        async with httpx.AsyncClient() as client:
+            api_url = "https://terabox-worker.robinkumarshakya103.workers.dev/api"
+            resp = await client.get(api_url, params={"url": url}, timeout=15)
+            data = resp.json()
+            if data.get("success") and data.get("files") and len(data["files"]) > 0:
+                file_data = data["files"][0]
+                # Try different download URL keys
+                for key in ["download_url", "streaming_url", "original_download_url"]:
+                    dl_link = file_data.get(key)
+                    if dl_link:
+                        logger.info(f"Attempting download with {key}: {dl_link}")
+                        # Add Referer header to avoid 403
+                        headers = {
+                            "Referer": "https://www.terabox.com/",
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                        }
+                        async with httpx.AsyncClient() as dl_client:
+                            dl_resp = await dl_client.get(dl_link, headers=headers, timeout=90, follow_redirects=True)
+                            if dl_resp.status_code == 200:
+                                file_path = os.path.join(tmpdir, "video.mp4")
+                                with open(file_path, "wb") as f:
+                                    f.write(dl_resp.content)
+                                size_mb = os.path.getsize(file_path) / 1024 / 1024
+                                return file_path, size_mb
+                            else:
+                                logger.warning(f"Download link {key} returned {dl_resp.status_code}")
     except Exception as e:
-        logger.warning(f"terabox-downloader failed: {e}")
+        logger.warning(f"API download failed: {e}")
 
-    # 2. Fallback: yt-dlp with ndus cookie and proper headers
+    # 2. Fallback: yt-dlp with cookie and referer
     cookie_content = f"# Netscape HTTP Cookie File\n.terabox.com\tTRUE\t/\tTRUE\t0\tndus\t{TERABOX_NDUS}\n"
     cookie_path = '/tmp/terabox_cookies.txt'
     with open(cookie_path, 'w') as f:
@@ -135,7 +143,7 @@ async def download_terabox(url, tmpdir):
         'quiet': False,
         'cookiefile': cookie_path,
         'headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Referer': 'https://www.terabox.com/'
         }
     }
