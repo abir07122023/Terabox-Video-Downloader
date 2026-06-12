@@ -7,12 +7,12 @@ import asyncio
 import httpx
 import uuid
 import threading
-import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import yt_dlp
+from TeraboxDL import TeraboxDL
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,11 +29,6 @@ USER_DATA_FILE = '/tmp/terabox_user_data.json'
 pending_tokens = {}
 
 executor = ThreadPoolExecutor(max_workers=4)
-
-# Helper to escape Markdown v2 characters
-def escape_markdown(text):
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(r'([%s])' % re.escape(escape_chars), r'\\\1', text)
 
 # ── ShrinkForge helper ───────────────────────────────────────────────
 async def get_shrinkforge_link(destination_url: str) -> str | None:
@@ -105,33 +100,63 @@ def can_use_free_video(user_id):
     count, _ = get_user_state(user_id)
     return count < 3
 
-# ── Download function (API with referer, then yt-dlp fallback) ──────
+# ── Download function (terabox-dl-py ➜ API ➜ yt-dlp) ────────────────
 async def download_terabox(url, tmpdir):
-    # Try public API
+    # 1. Try the `terabox-dl-py` package (primary method)
+    try:
+        # Initialize the library with your `ndus` cookie
+        cookie = f"lang=en; ndus={TERABOX_NDUS}"
+        terabox = TeraboxDL(cookie)
+        file_info = terabox.get_file_info(url, direct_url=True)
+
+        if "error" in file_info:
+            raise Exception(file_info["error"])
+
+        dl_link = file_info.get("download_link")
+        if not dl_link:
+            raise Exception("No download link found by terabox-dl-py")
+
+        logger.info(f"Downloading from terabox-dl-py link: {dl_link}")
+        async with httpx.AsyncClient() as dl_client:
+            # Note: The direct download link is often a simple HTTP URL.
+            dl_resp = await dl_client.get(dl_link, timeout=60)
+            file_path = os.path.join(tmpdir, "video.mp4")
+            with open(file_path, "wb") as f:
+                f.write(dl_resp.content)
+            size_mb = os.path.getsize(file_path) / 1024 / 1024
+            return file_path, size_mb
+
+    except Exception as e:
+        logger.warning(f"terabox-dl-py failed: {e}. Falling back to API + yt-dlp.")
+
+    # 2. Fallback: Try public API with different URL types
     try:
         async with httpx.AsyncClient() as client:
             api_url = "https://terabox-worker.robinkumarshakya103.workers.dev/api"
             resp = await client.get(api_url, params={"url": url}, timeout=15)
             data = resp.json()
             if data.get("success") and data.get("files") and len(data["files"]) > 0:
-                dl_link = data["files"][0].get("download_url")
-                if dl_link:
-                    # Add Referer header to avoid 403
-                    headers = {"Referer": "https://www.terabox.com/"}
-                    async with httpx.AsyncClient() as dl_client:
-                        dl_resp = await dl_client.get(dl_link, headers=headers, timeout=60)
-                        if dl_resp.status_code == 200:
-                            file_path = os.path.join(tmpdir, "video.mp4")
-                            with open(file_path, "wb") as f:
-                                f.write(dl_resp.content)
-                            size_mb = os.path.getsize(file_path) / 1024 / 1024
-                            return file_path, size_mb
-                        else:
-                            logger.warning(f"Download link returned {dl_resp.status_code}, falling back to yt-dlp")
+                file_data = data["files"][0]
+                # Try different download URLs
+                for key in ["download_url", "streaming_url", "original_download_url"]:
+                    dl_link = file_data.get(key)
+                    if dl_link:
+                        logger.info(f"Trying API download link: {key} -> {dl_link}")
+                        async with httpx.AsyncClient() as dl_client:
+                            dl_resp = await dl_client.get(dl_link, timeout=60)
+                            if dl_resp.status_code == 200:
+                                file_path = os.path.join(tmpdir, "video.mp4")
+                                with open(file_path, "wb") as f:
+                                    f.write(dl_resp.content)
+                                size_mb = os.path.getsize(file_path) / 1024 / 1024
+                                return file_path, size_mb
+                            else:
+                                logger.warning(f"Download link {key} returned {dl_resp.status_code}")
+                raise Exception("All download links from API failed")
     except Exception as e:
-        logger.warning(f"Public API failed: {e}")
+        logger.warning(f"Public API failed: {e}. Falling back to yt-dlp.")
 
-    # Fallback: yt-dlp with ndus cookie
+    # 3. Final fallback: yt-dlp with ndus cookie and proper headers
     cookie_content = f"# Netscape HTTP Cookie File\n.terabox.com\tTRUE\t/\tTRUE\t0\tndus\t{TERABOX_NDUS}\n"
     cookie_path = '/tmp/terabox_cookies.txt'
     with open(cookie_path, 'w') as f:
@@ -141,7 +166,10 @@ async def download_terabox(url, tmpdir):
         'format': 'best',
         'quiet': False,
         'cookiefile': cookie_path,
-        'headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        'headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Referer': 'https://www.terabox.com/'
+        }
     }
     loop = asyncio.get_running_loop()
     def _sync_dl():
@@ -227,6 +255,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.from_user.username or "no_username"
     log_user(user_id, username)
 
+    # Support all Terabox domains
     if not any(domain in url for domain in ["terabox.com", "terabox.app", "1024terabox.com"]):
         return
 
@@ -258,18 +287,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             file_path, size_mb = await download_terabox(url, tmpdir)
             elapsed = round(time.time() - start_time, 1)
-            platform_name = "Terabox"
-            # Escape caption to avoid Markdown errors
-            caption_text = f"📱 {platform_name}\n⏱️ {elapsed}s 🔥\n🤖 @Terabox_Linkto_Video_bot"
-            # Escape for MarkdownV2
-            caption = escape_markdown(caption_text)
+            caption = f"📱 *Terabox*\n⏱️ {elapsed}s 🔥\n🤖 @Terabox_Linkto_Video_bot"
 
             await status_msg.edit_text("✅ Sending...")
             with open(file_path, 'rb') as f:
                 if size_mb < 49:
-                    sent_msg = await update.message.reply_video(f, caption=caption, parse_mode='MarkdownV2')
+                    sent_msg = await update.message.reply_video(f, caption=caption, parse_mode='Markdown')
                 elif size_mb < 2000:
-                    sent_msg = await update.message.reply_document(f, caption=caption + "\n📦 (Sent as file)", parse_mode='MarkdownV2')
+                    sent_msg = await update.message.reply_document(f, caption=caption + "\n📦 (Sent as file)", parse_mode='Markdown')
                 else:
                     await status_msg.edit_text("❌ Too large (>2GB)")
                     return
