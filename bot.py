@@ -95,7 +95,7 @@ TERABOX_DOMAINS = [
 ]
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 1: USER DATA PERSISTENCE (unchanged)
+# SECTION 1: USER DATA PERSISTENCE
 # ══════════════════════════════════════════════════════════════════
 
 def load_user_data() -> dict:
@@ -185,7 +185,7 @@ def unlock_user(user_id: int) -> None:
     save_user_data(data)
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 2: TERABOX DOWNLOAD (using terabox-downloader)
+# SECTION 2: TERABOX DOWNLOAD (using terabox-downloader - FIXED)
 # ══════════════════════════════════════════════════════════════════
 
 def is_terabox_url(url: str) -> bool:
@@ -197,18 +197,18 @@ async def download_terabox_video(share_url: str) -> Optional[str]:
     Returns local file path or None.
     """
     try:
-        # Prepare cookie string as expected by the package
         cookie_str = f"lang=en; ndus={TERABOX_NDUS}"
         terabox = TeraboxDL(cookie_str)
 
-        # Get file info including direct download link
-        file_info = terabox.get_file_info(share_url, direct_url=True)
+        # Correct call: no 'direct_url' argument
+        file_info = terabox.get_file_info(share_url)
 
         if "error" in file_info:
             logger.error(f"Extraction failed: {file_info['error']}")
             return None
 
-        direct_link = file_info.get('download_link')
+        # Try both possible keys for direct link
+        direct_link = file_info.get('direct_link') or file_info.get('download_link')
         if not direct_link:
             logger.error("No download link found in extracted info.")
             return None
@@ -413,7 +413,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Unhandled error: {context.error}", exc_info=context.error)
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 6: KEEP-ALIVE WEB SERVER (for Render free tier)
+# SECTION 6: KEEP-ALIVE WEB SERVER
 # ══════════════════════════════════════════════════════════════════
 
 class KeepAliveHandler(BaseHTTPRequestHandler):
