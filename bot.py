@@ -27,7 +27,6 @@ SHRINKFORGE_API_URL = "https://shrinkforge.com/api"
 
 USER_DATA_FILE = '/tmp/terabox_user_data.json'
 pending_tokens = {}
-
 executor = ThreadPoolExecutor(max_workers=4)
 
 # ── ShrinkForge helper ───────────────────────────────────────────────
@@ -100,112 +99,72 @@ def can_use_free_video(user_id):
     count, _ = get_user_state(user_id)
     return count < 3
 
-# ── Direct Terabox extraction using ndus cookie (no external API) ─────
+# ── Get direct download link from Terabox using ndus cookie ──────────
 async def get_terabox_direct_link(share_url: str) -> str | None:
     """
-    Extract direct download link from a Terabox share URL using the ndus cookie.
-    Returns the direct video URL or None.
+    Extract direct download link using Terabox official API.
+    Supports terabox.com, terabox.app, 1024terabox.com.
     """
     try:
-        # Normalize URL: ensure it points to the sharing page
-        if "1024terabox.com" in share_url:
-            # Already a sharing link
-            pass
-        elif "terabox.com/s/" in share_url:
-            # Already a sharing link
-            pass
-        else:
-            # If a different domain, try to extract the share ID
-            match = re.search(r'/s/([a-zA-Z0-9]+)', share_url)
-            if not match:
-                logger.error(f"Could not extract share ID from {share_url}")
-                return None
-            share_id = match.group(1)
-            share_url = f"https://terabox.com/s/{share_id}"
+        # Normalise URL: extract the share ID (shorturl)
+        # Example: https://1024terabox.com/s/1z6VzQEXJuGdrTCeRVvlGfA
+        match = re.search(r'/s/([a-zA-Z0-9]+)', share_url)
+        if not match:
+            logger.error(f"Cannot extract share ID from {share_url}")
+            return None
+        shorturl = match.group(1)
 
-        # Prepare cookies for the request
+        # Prepare API request
+        api_url = "https://www.terabox.com/share/list"
+        params = {
+            "shorturl": shorturl,
+            "root": "1",
+            "page": "1",
+            "num": "100",
+            "order": "time",
+            "desc": "1",
+            "showmore": "1",
+            "app_id": "250528",
+            "web": "1",
+            "channel": "dubox",
+            "clienttype": "0",
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.terabox.com/",
+        }
         cookies = {"ndus": TERABOX_NDUS}
 
-        # Step 1: Get the share page to extract the file ID and sign
-        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True) as client:
-            resp = await client.get(share_url, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code != 200:
-                logger.error(f"Failed to fetch share page: {resp.status_code}")
-                return None
-
-            # Extract the file ID from the page (look for "fs_id" or similar)
-            # Modern Terabox pages embed data in a JSON blob.
-            # Look for "window.yourData" or "window.initData"
-            html = resp.text
-            # Try to find the file ID in the HTML
-            match = re.search(r'"fs_id"\s*:\s*(\d+)', html)
-            if not match:
-                # Alternative: look for file_id in a script tag
-                match = re.search(r'"file_id"\s*:\s*"(\d+)"', html)
-            if not match:
-                logger.error("Could not find file ID in share page")
-                return None
-            file_id = match.group(1)
-
-            # Extract the sign (short URL) – often the last part of the share link
-            sign_match = re.search(r'/s/([a-zA-Z0-9]+)', share_url)
-            sign = sign_match.group(1) if sign_match else None
-
-            # Step 2: Call the Terabox download API
-            api_url = "https://www.terabox.com/share/list"
-            params = {
-                "app_id": "250528",
-                "web": "1",
-                "channel": "dubox",
-                "clienttype": "0",
-                "jsToken": "",
-                "page": "1",
-                "num": "100",
-                "order": "time",
-                "desc": "1",
-                "showmore": "1",
-                "shorturl": sign or file_id,
-                "root": "1",
-            }
-            headers = {
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://www.terabox.com/",
-            }
+        async with httpx.AsyncClient(cookies=cookies, timeout=10) as client:
             resp = await client.get(api_url, params=params, headers=headers)
             if resp.status_code != 200:
-                logger.error(f"API call failed: {resp.status_code}")
+                logger.error(f"Terabox API returned {resp.status_code}")
                 return None
-
             data = resp.json()
             if data.get("errno") != 0:
-                logger.error(f"API error: {data.get('errmsg')}")
+                logger.error(f"Terabox API error: {data.get('errmsg')}")
                 return None
-
-            # Extract the first file's dlink (download link)
-            list_data = data.get("list", [])
-            if not list_data:
-                logger.error("No files found in share")
+            files = data.get("list", [])
+            if not files:
+                logger.error("No files in share")
                 return None
-
-            dlink = list_data[0].get("dlink")
+            dlink = files[0].get("dlink")
             if not dlink:
                 logger.error("No dlink in response")
                 return None
-
             return dlink
-
     except Exception as e:
-        logger.error(f"Terabox extraction error: {e}")
+        logger.error(f"Terabox direct link extraction error: {e}")
         return None
 
-# ── Download using direct extraction + yt-dlp fallback ───────────────
+# ── Download using direct link or fallback ───────────────────────────
 async def download_terabox(url, tmpdir):
-    # 1. Try to get direct link via official Terabox API
-    direct_url = await get_terabox_direct_link(url)
-    if direct_url:
-        logger.info(f"Got direct link from Terabox API")
+    # 1. Try direct link via Terabox API
+    direct_link = await get_terabox_direct_link(url)
+    if direct_link:
+        logger.info("Downloading via direct link")
         async with httpx.AsyncClient() as client:
-            resp = await client.get(direct_url, timeout=90, follow_redirects=True)
+            resp = await client.get(direct_link, timeout=90, follow_redirects=True)
             if resp.status_code == 200:
                 file_path = os.path.join(tmpdir, "video.mp4")
                 with open(file_path, "wb") as f:
@@ -213,7 +172,9 @@ async def download_terabox(url, tmpdir):
                 size_mb = os.path.getsize(file_path) / 1024 / 1024
                 return file_path, size_mb
             else:
-                logger.warning(f"Direct download failed with {resp.status_code}")
+                logger.warning(f"Direct download returned {resp.status_code}, falling back to yt-dlp")
+    else:
+        logger.warning("Could not get direct link, falling back to yt-dlp")
 
     # 2. Fallback: yt-dlp with ndus cookie
     cookie_content = f"# Netscape HTTP Cookie File\n.terabox.com\tTRUE\t/\tTRUE\t0\tndus\t{TERABOX_NDUS}\n"
@@ -362,7 +323,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Download error: {e}")
             await status_msg.edit_text("❌ Failed. Link may be invalid or cookie expired.")
 
-# ── Keep-alive web server ───────────────────────────────────────────
+# ── Keep‑alive web server (to prevent Render idle) ──────────────────
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -384,17 +345,20 @@ def main():
     if not SHRINKFORGE_API:
         logger.warning("SHRINKFORGE_API not set – ad system disabled")
 
+    # Start keep‑alive server
     thread = threading.Thread(target=run_keep_alive, daemon=True)
     thread.start()
     logger.info(f"Keep-alive server running on port {os.environ.get('PORT', '8000')}")
 
+    # Telegram bot
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
     logger.info("Bot started, polling...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Use drop_pending_updates=True to avoid old updates causing conflicts
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
