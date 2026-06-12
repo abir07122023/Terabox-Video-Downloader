@@ -7,6 +7,7 @@ import asyncio
 import httpx
 import uuid
 import threading
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,6 +29,11 @@ USER_DATA_FILE = '/tmp/terabox_user_data.json'
 pending_tokens = {}
 
 executor = ThreadPoolExecutor(max_workers=4)
+
+# Helper to escape Markdown v2 characters
+def escape_markdown(text):
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(r'([%s])' % re.escape(escape_chars), r'\\\1', text)
 
 # ── ShrinkForge helper ───────────────────────────────────────────────
 async def get_shrinkforge_link(destination_url: str) -> str | None:
@@ -99,25 +105,29 @@ def can_use_free_video(user_id):
     count, _ = get_user_state(user_id)
     return count < 3
 
-# ── Download function (API first, then yt-dlp fallback) ─────────────
+# ── Download function (API with referer, then yt-dlp fallback) ──────
 async def download_terabox(url, tmpdir):
-    # Try public API (fast)
+    # Try public API
     try:
         async with httpx.AsyncClient() as client:
             api_url = "https://terabox-worker.robinkumarshakya103.workers.dev/api"
             resp = await client.get(api_url, params={"url": url}, timeout=15)
             data = resp.json()
-            # The API returns "success" key, not "ok"
             if data.get("success") and data.get("files") and len(data["files"]) > 0:
                 dl_link = data["files"][0].get("download_url")
                 if dl_link:
+                    # Add Referer header to avoid 403
+                    headers = {"Referer": "https://www.terabox.com/"}
                     async with httpx.AsyncClient() as dl_client:
-                        dl_resp = await dl_client.get(dl_link, timeout=60)
-                        file_path = os.path.join(tmpdir, "video.mp4")
-                        with open(file_path, "wb") as f:
-                            f.write(dl_resp.content)
-                        size_mb = os.path.getsize(file_path) / 1024 / 1024
-                        return file_path, size_mb
+                        dl_resp = await dl_client.get(dl_link, headers=headers, timeout=60)
+                        if dl_resp.status_code == 200:
+                            file_path = os.path.join(tmpdir, "video.mp4")
+                            with open(file_path, "wb") as f:
+                                f.write(dl_resp.content)
+                            size_mb = os.path.getsize(file_path) / 1024 / 1024
+                            return file_path, size_mb
+                        else:
+                            logger.warning(f"Download link returned {dl_resp.status_code}, falling back to yt-dlp")
     except Exception as e:
         logger.warning(f"Public API failed: {e}")
 
@@ -217,7 +227,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.from_user.username or "no_username"
     log_user(user_id, username)
 
-    # Support all Terabox domains
     if not any(domain in url for domain in ["terabox.com", "terabox.app", "1024terabox.com"]):
         return
 
@@ -249,14 +258,18 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             file_path, size_mb = await download_terabox(url, tmpdir)
             elapsed = round(time.time() - start_time, 1)
-            caption = f"📱 *Terabox*\n⏱️ {elapsed}s 🔥\n🤖 @Terabox_Linkto_Video_bot"
+            platform_name = "Terabox"
+            # Escape caption to avoid Markdown errors
+            caption_text = f"📱 {platform_name}\n⏱️ {elapsed}s 🔥\n🤖 @Terabox_Linkto_Video_bot"
+            # Escape for MarkdownV2
+            caption = escape_markdown(caption_text)
 
             await status_msg.edit_text("✅ Sending...")
             with open(file_path, 'rb') as f:
                 if size_mb < 49:
-                    sent_msg = await update.message.reply_video(f, caption=caption, parse_mode='Markdown')
+                    sent_msg = await update.message.reply_video(f, caption=caption, parse_mode='MarkdownV2')
                 elif size_mb < 2000:
-                    sent_msg = await update.message.reply_document(f, caption=caption + "\n📦 (Sent as file)", parse_mode='Markdown')
+                    sent_msg = await update.message.reply_document(f, caption=caption + "\n📦 (Sent as file)", parse_mode='MarkdownV2')
                 else:
                     await status_msg.edit_text("❌ Too large (>2GB)")
                     return
