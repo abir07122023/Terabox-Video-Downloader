@@ -7,17 +7,19 @@ import asyncio
 import httpx
 import uuid
 import threading
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+import yt_dlp
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Environment variables ─────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-TERABOX_NDUS = os.environ.get("TERABOX_NDUS")  # kept for possible future use but not required for this API
+TERABOX_NDUS = os.environ.get("TERABOX_NDUS")
 LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "-1003956558170"))
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "6294267891"))
 SHRINKFORGE_API = os.environ.get("SHRINKFORGE_API")
@@ -98,31 +100,149 @@ def can_use_free_video(user_id):
     count, _ = get_user_state(user_id)
     return count < 3
 
-# ── Download using reliable public API (no cookie needed) ────────────
-async def download_terabox(url, tmpdir):
-    # Use the Vercel API that works for Terabox links
-    api_url = "https://terabox-dl.vercel.app/api"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(api_url, params={"url": url}, timeout=30)
-        if resp.status_code != 200:
-            raise Exception(f"API returned {resp.status_code}")
-        data = resp.json()
-        if not data.get("success") or not data.get("download_url"):
-            raise Exception("API response missing download_url")
-        dl_link = data["download_url"]
-        logger.info(f"Download link obtained: {dl_link[:100]}...")
-        # Download the file
-        async with httpx.AsyncClient() as dl_client:
-            dl_resp = await dl_client.get(dl_link, timeout=90, follow_redirects=True)
-            if dl_resp.status_code != 200:
-                raise Exception(f"Download failed with {dl_resp.status_code}")
-            file_path = os.path.join(tmpdir, "video.mp4")
-            with open(file_path, "wb") as f:
-                f.write(dl_resp.content)
-            size_mb = os.path.getsize(file_path) / 1024 / 1024
-            return file_path, size_mb
+# ── Direct Terabox extraction using ndus cookie (no external API) ─────
+async def get_terabox_direct_link(share_url: str) -> str | None:
+    """
+    Extract direct download link from a Terabox share URL using the ndus cookie.
+    Returns the direct video URL or None.
+    """
+    try:
+        # Normalize URL: ensure it points to the sharing page
+        if "1024terabox.com" in share_url:
+            # Already a sharing link
+            pass
+        elif "terabox.com/s/" in share_url:
+            # Already a sharing link
+            pass
+        else:
+            # If a different domain, try to extract the share ID
+            match = re.search(r'/s/([a-zA-Z0-9]+)', share_url)
+            if not match:
+                logger.error(f"Could not extract share ID from {share_url}")
+                return None
+            share_id = match.group(1)
+            share_url = f"https://terabox.com/s/{share_id}"
 
-# ── Telegram helpers ─────────────────────────────────────────────────
+        # Prepare cookies for the request
+        cookies = {"ndus": TERABOX_NDUS}
+
+        # Step 1: Get the share page to extract the file ID and sign
+        async with httpx.AsyncClient(cookies=cookies, follow_redirects=True) as client:
+            resp = await client.get(share_url, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code != 200:
+                logger.error(f"Failed to fetch share page: {resp.status_code}")
+                return None
+
+            # Extract the file ID from the page (look for "fs_id" or similar)
+            # Modern Terabox pages embed data in a JSON blob.
+            # Look for "window.yourData" or "window.initData"
+            html = resp.text
+            # Try to find the file ID in the HTML
+            match = re.search(r'"fs_id"\s*:\s*(\d+)', html)
+            if not match:
+                # Alternative: look for file_id in a script tag
+                match = re.search(r'"file_id"\s*:\s*"(\d+)"', html)
+            if not match:
+                logger.error("Could not find file ID in share page")
+                return None
+            file_id = match.group(1)
+
+            # Extract the sign (short URL) – often the last part of the share link
+            sign_match = re.search(r'/s/([a-zA-Z0-9]+)', share_url)
+            sign = sign_match.group(1) if sign_match else None
+
+            # Step 2: Call the Terabox download API
+            api_url = "https://www.terabox.com/share/list"
+            params = {
+                "app_id": "250528",
+                "web": "1",
+                "channel": "dubox",
+                "clienttype": "0",
+                "jsToken": "",
+                "page": "1",
+                "num": "100",
+                "order": "time",
+                "desc": "1",
+                "showmore": "1",
+                "shorturl": sign or file_id,
+                "root": "1",
+            }
+            headers = {
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://www.terabox.com/",
+            }
+            resp = await client.get(api_url, params=params, headers=headers)
+            if resp.status_code != 200:
+                logger.error(f"API call failed: {resp.status_code}")
+                return None
+
+            data = resp.json()
+            if data.get("errno") != 0:
+                logger.error(f"API error: {data.get('errmsg')}")
+                return None
+
+            # Extract the first file's dlink (download link)
+            list_data = data.get("list", [])
+            if not list_data:
+                logger.error("No files found in share")
+                return None
+
+            dlink = list_data[0].get("dlink")
+            if not dlink:
+                logger.error("No dlink in response")
+                return None
+
+            return dlink
+
+    except Exception as e:
+        logger.error(f"Terabox extraction error: {e}")
+        return None
+
+# ── Download using direct extraction + yt-dlp fallback ───────────────
+async def download_terabox(url, tmpdir):
+    # 1. Try to get direct link via official Terabox API
+    direct_url = await get_terabox_direct_link(url)
+    if direct_url:
+        logger.info(f"Got direct link from Terabox API")
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(direct_url, timeout=90, follow_redirects=True)
+            if resp.status_code == 200:
+                file_path = os.path.join(tmpdir, "video.mp4")
+                with open(file_path, "wb") as f:
+                    f.write(resp.content)
+                size_mb = os.path.getsize(file_path) / 1024 / 1024
+                return file_path, size_mb
+            else:
+                logger.warning(f"Direct download failed with {resp.status_code}")
+
+    # 2. Fallback: yt-dlp with ndus cookie
+    cookie_content = f"# Netscape HTTP Cookie File\n.terabox.com\tTRUE\t/\tTRUE\t0\tndus\t{TERABOX_NDUS}\n"
+    cookie_path = '/tmp/terabox_cookies.txt'
+    with open(cookie_path, 'w') as f:
+        f.write(cookie_content)
+    opts = {
+        'outtmpl': f'{tmpdir}/video.%(ext)s',
+        'format': 'best',
+        'quiet': False,
+        'cookiefile': cookie_path,
+        'headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.terabox.com/'
+        }
+    }
+    loop = asyncio.get_running_loop()
+    def _sync_dl():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        files = [f for f in os.listdir(tmpdir) if f.startswith('video')]
+        if not files:
+            raise Exception("No file downloaded")
+        file_path = os.path.join(tmpdir, files[0])
+        size_mb = os.path.getsize(file_path) / 1024 / 1024
+        return file_path, size_mb
+    return await loop.run_in_executor(executor, _sync_dl)
+
+# ── Telegram helpers (unchanged) ─────────────────────────────────────
 def log_user(user_id, username):
     try:
         with open('/tmp/terabox_users.txt', 'a') as f:
@@ -223,7 +343,6 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
-            # The download function is async, no need for thread pool
             file_path, size_mb = await download_terabox(url, tmpdir)
             elapsed = round(time.time() - start_time, 1)
             caption = f"📱 *Terabox*\n⏱️ {elapsed}s 🔥\n🤖 @Terabox_Linkto_Video_bot"
@@ -241,7 +360,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.delete()
         except Exception as e:
             logger.error(f"Download error: {e}")
-            await status_msg.edit_text("❌ Failed. Link may be invalid or API down.")
+            await status_msg.edit_text("❌ Failed. Link may be invalid or cookie expired.")
 
 # ── Keep-alive web server ───────────────────────────────────────────
 class KeepAliveHandler(BaseHTTPRequestHandler):
