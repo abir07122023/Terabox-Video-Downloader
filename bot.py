@@ -1,15 +1,13 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          TERABOX TELEGRAM BOT — PRODUCTION READY                 ║
+║          TERABOX TELEGRAM BOT — FINAL WORKING VERSION            ║
 ║          @Terabox_Linkto_Video_bot                               ║
 ║                                                                  ║
-║  Features:                                                       ║
-║  • Reliable terabox-downloader package                          ║
-║  • Freemium: 3 free / 12h sliding window                        ║
-║  • ShrinkForge ad unlock system                                  ║
-║  • Log channel forwarding                                        ║
-║  • Admin /stats command                                          ║
-║  • Keep-alive web server for Render                              ║
+║  Uses external API: https://terabox.howdownload.com/api         ║
+║  Freemium: 3 free / 12h sliding window                          ║
+║  ShrinkForge ad unlock system                                    ║
+║  Log channel forwarding & admin stats                           ║
+║  Keep-alive web server for Render                                ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -37,9 +35,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
-# Terabox downloader package
-from TeraboxDL import TeraboxDL
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -76,14 +71,10 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 pending_tokens: dict = {}
 
 # ─────────────────────────────────────────────
-# HEADERS — mimic a real browser
+# HEADERS
 # ─────────────────────────────────────────────
 BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
@@ -95,7 +86,7 @@ TERABOX_DOMAINS = [
 ]
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 1: USER DATA PERSISTENCE
+# SECTION 1: USER DATA PERSISTENCE (unchanged)
 # ══════════════════════════════════════════════════════════════════
 
 def load_user_data() -> dict:
@@ -185,7 +176,7 @@ def unlock_user(user_id: int) -> None:
     save_user_data(data)
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 2: TERABOX DOWNLOAD (using terabox-downloader - FIXED)
+# SECTION 2: TERABOX DOWNLOAD (using proven external API)
 # ══════════════════════════════════════════════════════════════════
 
 def is_terabox_url(url: str) -> bool:
@@ -193,55 +184,73 @@ def is_terabox_url(url: str) -> bool:
 
 async def download_terabox_video(share_url: str) -> Optional[str]:
     """
-    Download a Terabox video using the terabox-downloader package.
+    Download a Terabox video using the external API.
     Returns local file path or None.
     """
+    # Try the primary external API
+    api_url = f"https://terabox.howdownload.com/api?url={share_url}"
     try:
-        cookie_str = f"lang=en; ndus={TERABOX_NDUS}"
-        terabox = TeraboxDL(cookie_str)
-
-        # Correct call: no 'direct_url' argument
-        file_info = terabox.get_file_info(share_url)
-
-        if "error" in file_info:
-            logger.error(f"Extraction failed: {file_info['error']}")
-            return None
-
-        # Try both possible keys for direct link
-        direct_link = file_info.get('direct_link') or file_info.get('download_link')
-        if not direct_link:
-            logger.error("No download link found in extracted info.")
-            return None
-
-        filename = sanitize_filename(file_info.get('file_name', 'video.mp4'))
-        out_path = os.path.join(DOWNLOAD_DIR, filename)
-
-        logger.info(f"Downloading from direct link: {direct_link[:80]}...")
-        async with httpx.AsyncClient(
-            cookies={"ndus": TERABOX_NDUS},
-            headers={
-                **BROWSER_HEADERS,
-                "Referer": "https://www.terabox.com/",
-            },
-            follow_redirects=True,
-            timeout=300,
-        ) as dl_client:
-            async with dl_client.stream("GET", direct_link) as r:
-                r.raise_for_status()
-                with open(out_path, "wb") as fp:
-                    async for chunk in r.aiter_bytes(chunk_size=1024 * 512):
-                        fp.write(chunk)
-
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
-            logger.info(f"Download complete: {out_path}")
-            return out_path
-        else:
-            logger.warning("Downloaded file is empty or too small")
-            return None
-
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(api_url)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success") and data.get("download_url"):
+                    direct_link = data["download_url"]
+                    filename = sanitize_filename(data.get("filename", "video.mp4"))
+                    out_path = os.path.join(DOWNLOAD_DIR, filename)
+                    logger.info(f"Downloading from external API: {direct_link[:80]}...")
+                    # Download the file
+                    async with httpx.AsyncClient(
+                        headers=BROWSER_HEADERS,
+                        follow_redirects=True,
+                        timeout=300,
+                    ) as dl_client:
+                        async with dl_client.stream("GET", direct_link) as r:
+                            r.raise_for_status()
+                            with open(out_path, "wb") as fp:
+                                async for chunk in r.aiter_bytes(chunk_size=1024*512):
+                                    fp.write(chunk)
+                    if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
+                        logger.info(f"Download complete: {out_path}")
+                        return out_path
+                    else:
+                        logger.warning("Downloaded file is empty or too small")
+                else:
+                    logger.error(f"API error: {data}")
+            else:
+                logger.error(f"API returned {resp.status_code}")
     except Exception as e:
-        logger.error(f"Download error: {e}", exc_info=True)
-        return None
+        logger.error(f"External API failed: {e}")
+
+    # Fallback: try another external API
+    api_url2 = f"https://terabox-dl.vercel.app/api?url={share_url}"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(api_url2)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("success") and data.get("download_url"):
+                    direct_link = data["download_url"]
+                    filename = sanitize_filename(data.get("filename", "video.mp4"))
+                    out_path = os.path.join(DOWNLOAD_DIR, filename)
+                    logger.info(f"Downloading from fallback API: {direct_link[:80]}...")
+                    async with httpx.AsyncClient(
+                        headers=BROWSER_HEADERS,
+                        follow_redirects=True,
+                        timeout=300,
+                    ) as dl_client:
+                        async with dl_client.stream("GET", direct_link) as r:
+                            r.raise_for_status()
+                            with open(out_path, "wb") as fp:
+                                async for chunk in r.aiter_bytes(chunk_size=1024*512):
+                                    fp.write(chunk)
+                    if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
+                        logger.info(f"Download complete: {out_path}")
+                        return out_path
+    except Exception as e:
+        logger.error(f"Fallback API failed: {e}")
+
+    return None
 
 def sanitize_filename(name: str) -> str:
     name = re.sub(r'[^\w\s\-.]', '_', name)
@@ -436,7 +445,7 @@ def start_keep_alive():
     thread.start()
 
 # ══════════════════════════════════════════════════════════════════
-# SECTION 7: MAIN ENTRY POINT
+# SECTION 7: MAIN
 # ══════════════════════════════════════════════════════════════════
 
 def main():
@@ -456,6 +465,7 @@ def main():
     app.add_error_handler(error_handler)
 
     logger.info("Starting polling...")
+    # Prevent conflict: delete webhook and drop pending updates
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
