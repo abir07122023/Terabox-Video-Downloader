@@ -270,6 +270,14 @@ async def fetch_share_page_params(share_url: str, client: httpx.AsyncClient) -> 
     """
     logger.info(f"Fetching share page: {share_url}")
 
+    params = {}
+
+    # ── Extract surl BEFORE URL redirects change it ──────────────────
+    # Try /s/ format first
+    surl_match = re.search(r"/s/([A-Za-z0-9_\-]+)", share_url)
+    if surl_match:
+        params["surl"] = surl_match.group(1)
+
     try:
         resp = await client.get(
             share_url,
@@ -285,12 +293,12 @@ async def fetch_share_page_params(share_url: str, client: httpx.AsyncClient) -> 
 
     logger.info(f"Final URL after redirects: {final_url}")
 
-    params = {}
-
-    # ── Extract surl (the short URL key after /s/) ──────────────────
-    surl_match = re.search(r"/s/([A-Za-z0-9_\-]+)", share_url)
-    if surl_match:
-        params["surl"] = surl_match.group(1)
+    # ── Extract surl from query params if not found in original URL ──
+    # After redirect, might be surl=xxxxx in query string
+    if not params.get("surl"):
+        query_match = re.search(r"[?&]surl=([A-Za-z0-9_\-]+)", final_url)
+        if query_match:
+            params["surl"] = query_match.group(1)
 
     # ── STRATEGY 1: Look for window.yunData = {...} ────────────────
     # Try greedy first, then non-greedy
@@ -415,10 +423,11 @@ async def get_terabox_dlink(share_url: str) -> Optional[dict]:
         uk        = params.get("uk", "")
 
         logger.info(
-            f"Calling primary API with: surl={surl}, shareid={shareid}, uk={uk}, sign={sign[:20] if sign else 'N/A'}"
+            f"Extracted params: surl={surl}, uk={uk}, sign={sign[:20] if sign else 'N/A'}, shareid={shareid}"
         )
 
         # ── STEP 3: Call the Terabox share/list API ──────────────────
+        # Build minimal API call - Terabox MIGHT accept just surl + cookie
         api_url = "https://www.terabox.com/share/list"
         api_params = {
             "app_id":         "250528",
@@ -427,9 +436,6 @@ async def get_terabox_dlink(share_url: str) -> Optional[dict]:
             "clienttype":     "0",
             "page":           "1",
             "num":            "20",
-            "by":             "name",
-            "order":          "asc",
-            "site_referer":   share_url,
             "shorturl":       surl,
             "root":           "1",
         }
@@ -445,6 +451,13 @@ async def get_terabox_dlink(share_url: str) -> Optional[dict]:
             api_params["shareid"] = shareid
         if uk:
             api_params["uk"] = uk
+        if sign and uk:
+            # If we have sign + uk, also try setting randsk which Terabox often uses
+            import hashlib
+            randsk = hashlib.md5(f"{uk}{sign}".encode()).hexdigest()
+            api_params["randsk"] = randsk
+
+        logger.info(f"Primary API call with {len(api_params)} params")
 
         try:
             api_resp = await client.get(
@@ -452,7 +465,7 @@ async def get_terabox_dlink(share_url: str) -> Optional[dict]:
                 params=api_params,
                 headers={
                     **BROWSER_HEADERS,
-                    "Referer": share_url,
+                    "Referer": share_url if share_url else "https://www.terabox.com/",
                     "X-Requested-With": "XMLHttpRequest",
                 },
                 timeout=20,
@@ -479,54 +492,110 @@ async def get_terabox_dlink(share_url: str) -> Optional[dict]:
 
 async def try_fallback_terabox_api(share_url: str) -> Optional[dict]:
     """
-    Fallback to external Terabox API service.
-    These are free services that work when the primary method fails.
-    
-    Using: terabox.app (terabox-dl equivalent)
+    Fallback strategies:
+    1. Try calling Terabox API with JUST surl parameter
+    2. Try external Terabox download APIs
+    3. Try direct HEAD request to see if we get redirected to download
     """
-    logger.info("Attempting fallback Terabox API...")
+    logger.info("Attempting fallback strategies...")
 
-    # Extract surl from URL
+    # Extract surl
     surl_match = re.search(r"/s/([A-Za-z0-9_\-]+)", share_url)
     if not surl_match:
+        surl_match = re.search(r"[?&]surl=([A-Za-z0-9_\-]+)", share_url)
+    
+    if not surl_match:
         return None
+    
     surl = surl_match.group(1)
 
-    # Try a few known working fallback APIs
-    fallback_endpoints = [
-        f"https://terabox.app/api/get?link=https://1024terabox.com/s/{surl}",
-        f"https://teraboxapi.herokuapp.com/?link=https://1024terabox.com/s/{surl}",
-    ]
-
-    for endpoint in fallback_endpoints:
-        try:
-            async with httpx.AsyncClient(timeout=15) as fallback_client:
-                resp = await fallback_client.get(
-                    endpoint,
-                    headers=BROWSER_HEADERS,
-                )
-                data = resp.json()
-
-                # Different APIs return different structures
-                # Try common keys
-                file_list = (
-                    data.get("list") or
-                    data.get("data") or
-                    data.get("files") or
-                    [data] if "dlink" in data else []
-                )
-
+    # ── STRATEGY 1: Try API with just surl ────────────────────────
+    logger.info(f"[FB1] Trying Terabox API with minimal params (surl only)...")
+    try:
+        async with httpx.AsyncClient(
+            cookies={"ndus": TERABOX_NDUS},
+            headers=BROWSER_HEADERS,
+            timeout=20,
+        ) as fallback_client:
+            minimal_params = {
+                "app_id":     "250528",
+                "web":        "1",
+                "channel":    "dubox",
+                "shorturl":   surl,
+                "root":       "1",
+            }
+            resp = await fallback_client.get(
+                "https://www.terabox.com/share/list",
+                params=minimal_params,
+            )
+            data = resp.json()
+            
+            if data.get("errno") == 0:
+                file_list = data.get("list", [])
                 if file_list:
                     result = extract_dlink_from_list(file_list)
                     if result:
-                        logger.info(f"Fallback API success: {result['filename']}")
+                        logger.info(f"[FB1] Success: {result['filename']}")
                         return result
+    except Exception as e:
+        logger.debug(f"[FB1] Failed: {e}")
 
+    # ── STRATEGY 2: External Terabox extraction APIs ────────────────
+    logger.info(f"[FB2] Trying external Terabox APIs...")
+    
+    external_apis = [
+        # Format: (endpoint_template, response_key)
+        (f"https://terabox.app/api/get?link=https://1024terabox.com/s/{surl}", "list"),
+        (f"https://teraboxes.com/api?link=https://1024terabox.com/s/{surl}", "data"),
+        (f"https://terabox-api.com/api?url=https://1024terabox.com/s/{surl}", "files"),
+    ]
+    
+    for endpoint, key in external_apis:
+        try:
+            async with httpx.AsyncClient(timeout=15) as ext_client:
+                resp = await ext_client.get(endpoint, headers=BROWSER_HEADERS)
+                data = resp.json()
+                
+                file_list = data.get(key) or data.get("list") or data.get("data") or []
+                if isinstance(file_list, dict) and "dlink" in file_list:
+                    file_list = [file_list]
+                
+                if file_list:
+                    result = extract_dlink_from_list(file_list)
+                    if result:
+                        logger.info(f"[FB2] Success with {endpoint}: {result['filename']}")
+                        return result
         except Exception as e:
-            logger.debug(f"Fallback endpoint failed: {e}")
-            continue
+            logger.debug(f"[FB2] {endpoint} failed: {e}")
 
-    logger.error("All fallback APIs failed")
+    # ── STRATEGY 3: Try HEAD request to see redirect ────────────────
+    # Some Terabox setups might redirect directly to download if properly authenticated
+    logger.info(f"[FB3] Trying direct share page download...")
+    try:
+        async with httpx.AsyncClient(
+            cookies={"ndus": TERABOX_NDUS},
+            headers={
+                **BROWSER_HEADERS,
+                "Range": "bytes=0-1",  # Request just 1 byte to trigger download
+            },
+            follow_redirects=False,
+            timeout=10,
+        ) as dl_client:
+            resp = await dl_client.head(share_url)
+            # Check for redirect to download URL
+            if resp.status_code in (301, 302, 303, 307, 308):
+                download_url = resp.headers.get("Location")
+                if download_url and ("download" in download_url or "dlink" in download_url):
+                    logger.info(f"[FB3] Got redirect to: {download_url[:80]}")
+                    return {
+                        "dlink": download_url,
+                        "filename": f"terabox_{surl}.mp4",
+                        "size": 0,
+                    }
+    except Exception as e:
+        logger.debug(f"[FB3] Failed: {e}")
+
+    logger.error("All fallback strategies exhausted")
     return None
 
 
