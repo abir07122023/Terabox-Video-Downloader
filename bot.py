@@ -10,7 +10,7 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 import yt_dlp
 
 logging.basicConfig(level=logging.INFO)
@@ -99,27 +99,9 @@ def can_use_free_video(user_id):
     count, _ = get_user_state(user_id)
     return count < 3
 
-# ── Terabox download (API + yt-dlp fallback) ────────────────────────
-async def download_terabox(url, tmpdir):
-    # Public API first
-    try:
-        async with httpx.AsyncClient() as client:
-            api_url = "https://terabox-worker.robinkumarshakya103.workers.dev/api"
-            resp = await client.get(api_url, params={"url": url}, timeout=15)
-            data = resp.json()
-            if data.get("ok") and data.get("download_url"):
-                dl_link = data["download_url"]
-                async with httpx.AsyncClient() as dl_client:
-                    dl_resp = await dl_client.get(dl_link, timeout=60)
-                    file_path = os.path.join(tmpdir, "video.mp4")
-                    with open(file_path, "wb") as f:
-                        f.write(dl_resp.content)
-                    size_mb = os.path.getsize(file_path) / 1024 / 1024
-                    return file_path, size_mb
-    except Exception as e:
-        logger.warning(f"API failed: {e}")
-
-    # Fallback: yt-dlp with ndus cookie
+# ── Terabox download: sync version for thread (yt-dlp only) ─────────
+def download_terabox_sync(url, tmpdir):
+    """Synchronous download using yt-dlp (for thread pool)."""
     cookie_content = f"# Netscape Cookie\n.terabox.com\tTRUE\t/\tTRUE\t0\tndus\t{TERABOX_NDUS}\n"
     cookie_path = '/tmp/terabox_cookies.txt'
     with open(cookie_path, 'w') as f:
@@ -138,6 +120,30 @@ async def download_terabox(url, tmpdir):
     file_path = os.path.join(tmpdir, files[0])
     size_mb = os.path.getsize(file_path) / 1024 / 1024
     return file_path, size_mb
+
+# ── Async download handler (API first, then fallback to thread) ─────
+async def download_terabox_async(url, tmpdir):
+    # Try public API (fast, async)
+    try:
+        async with httpx.AsyncClient() as client:
+            api_url = "https://terabox-worker.robinkumarshakya103.workers.dev/api"
+            resp = await client.get(api_url, params={"url": url}, timeout=15)
+            data = resp.json()
+            if data.get("ok") and data.get("download_url"):
+                download_link = data["download_url"]
+                async with httpx.AsyncClient() as dl_client:
+                    dl_resp = await dl_client.get(download_link, timeout=60)
+                    file_path = os.path.join(tmpdir, "video.mp4")
+                    with open(file_path, "wb") as f:
+                        f.write(dl_resp.content)
+                    size_mb = os.path.getsize(file_path) / 1024 / 1024
+                    return file_path, size_mb
+    except Exception as e:
+        logger.warning(f"Public API failed: {e}")
+
+    # Fallback: run yt-dlp in thread (blocking)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, download_terabox_sync, url, tmpdir)
 
 # ── Telegram helpers ─────────────────────────────────────────────────
 def log_user(user_id, username):
@@ -211,7 +217,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.from_user.username or "no_username"
     log_user(user_id, username)
 
-    if "terabox.com" not in url and "terabox.app" not in url:
+    if "terabox.com" not in url and "terabox.app" not in url and "1024terabox.com" not in url:
         return
 
     start_time = time.time()
@@ -240,8 +246,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
-            loop = asyncio.get_running_loop()
-            file_path, size_mb = await loop.run_in_executor(executor, download_terabox, url, tmpdir)
+            file_path, size_mb = await download_terabox_async(url, tmpdir)
             elapsed = round(time.time() - start_time, 1)
             caption = f"📱 *Terabox*\n⏱️ {elapsed}s 🔥\n🤖 @Terabox_Linkto_Video_bot"
 
@@ -260,14 +265,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Download error: {e}")
             await status_msg.edit_text("❌ Failed. Link may be invalid.")
 
-# ── Simple keep-alive web server (no Flask) ─────────────────────────
+# ── Keep-alive web server ───────────────────────────────────────────
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
     def log_message(self, format, *args):
-        pass  # suppress logs
+        pass
 
 def run_keep_alive():
     port = int(os.environ.get("PORT", 8000))
@@ -282,7 +287,7 @@ def main():
     if not SHRINKFORGE_API:
         logger.warning("SHRINKFORGE_API not set – ad system disabled")
 
-    # Start keep-alive server in background thread
+    # Start keep-alive server
     thread = threading.Thread(target=run_keep_alive, daemon=True)
     thread.start()
     logger.info(f"Keep-alive server running on port {os.environ.get('PORT', '8000')}")
