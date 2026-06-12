@@ -1,18 +1,19 @@
 import os
 import json
+import re
 import logging
 import tempfile
 import time
 import asyncio
-import httpx
-import uuid
 import threading
-import re
+import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor
+
+import httpx
+import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
-import yt_dlp
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -99,61 +100,79 @@ def can_use_free_video(user_id):
     count, _ = get_user_state(user_id)
     return count < 3
 
-# ── Get dynamic parameters from share page ──────────────────────────
+# ── Extract share parameters from Terabox page (works for all domains) ──
 async def get_share_params(share_url: str) -> dict | None:
-    """Extract sign, timestamp, shareid, uk from the share page."""
+    """Fetch the share page and extract shareid, uk, sign, timestamp."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
-        resp = await client.get(share_url, timeout=15)
+    async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15) as client:
+        resp = await client.get(share_url)
         if resp.status_code != 200:
             logger.error(f"Failed to fetch share page: {resp.status_code}")
             return None
         html = resp.text
-        # Look for the data embedded in a script tag
-        # Typical pattern: window.yourData = {...}
-        match = re.search(r'window\.yourData\s*=\s*({.+?});', html, re.DOTALL)
-        if not match:
-            # Alternative pattern
-            match = re.search(r'window\.initData\s*=\s*({.+?});', html, re.DOTALL)
-        if not match:
-            # Fallback: look for a JSON object containing shareid, uk, sign
-            match = re.search(r'"shareid"\s*:\s*(\d+).*?"uk"\s*:\s*(\d+).*?"sign"\s*:\s*"([^"]+)"', html, re.DOTALL)
-            if match:
-                shareid = match.group(1)
-                uk = match.group(2)
-                sign = match.group(3)
-                timestamp = str(int(time.time()))
-                return {"shareid": shareid, "uk": uk, "sign": sign, "timestamp": timestamp}
-            logger.error("Could not extract share parameters from page")
-            return None
-        data = json.loads(match.group(1))
-        # Navigate through the nested structure (depends on Terabox's current format)
-        share_info = data.get("shareInfo") or data.get("share") or data
-        shareid = share_info.get("shareid")
-        uk = share_info.get("uk")
-        sign = share_info.get("sign")
-        if not shareid or not uk or not sign:
-            # Try to find in list
-            file_list = data.get("fileList", [])
-            if file_list and len(file_list) > 0:
-                shareid = file_list[0].get("shareid")
-                uk = file_list[0].get("uk")
-                sign = file_list[0].get("sign")
-        if not shareid or not uk or not sign:
-            logger.error("Missing required parameters (shareid, uk, sign) in extracted data")
-            return None
-        timestamp = str(int(time.time()))
-        return {"shareid": str(shareid), "uk": str(uk), "sign": sign, "timestamp": timestamp}
 
-# ── Get direct download link using the extracted parameters ─────────
+    # Try to find the JSON data in <script> tags
+    # Patterns observed: window.yourData = {...}; or window.initData = {...};
+    patterns = [
+        r'window\.yourData\s*=\s*({.*?});',
+        r'window\.initData\s*=\s*({.*?});',
+        r'<script[^>]*>\s*window\._shareData\s*=\s*({.*?})</script>',
+        r'<script[^>]*>\s*var\s+shareInfo\s*=\s*({.*?})</script>'
+    ]
+    data = None
+    for pat in patterns:
+        match = re.search(pat, html, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(1))
+                break
+            except:
+                continue
+    if not data:
+        # Fallback: look for shareid, uk, sign in the HTML as separate variables
+        shareid_match = re.search(r'"shareid"\s*:\s*(\d+)', html)
+        uk_match = re.search(r'"uk"\s*:\s*(\d+)', html)
+        sign_match = re.search(r'"sign"\s*:\s*"([^"]+)"', html)
+        if shareid_match and uk_match and sign_match:
+            return {
+                "shareid": shareid_match.group(1),
+                "uk": uk_match.group(1),
+                "sign": sign_match.group(1),
+                "timestamp": str(int(time.time()))
+            }
+        logger.error("Could not extract share parameters from page")
+        return None
+
+    # Navigate through the data structure (varies)
+    share_info = data.get("shareInfo") or data.get("share") or data
+    shareid = share_info.get("shareid") or data.get("shareid")
+    uk = share_info.get("uk") or data.get("uk")
+    sign = share_info.get("sign") or data.get("sign")
+    if not shareid or not uk or not sign:
+        # Try looking inside fileList
+        file_list = data.get("fileList", [])
+        if file_list and len(file_list) > 0:
+            shareid = file_list[0].get("shareid")
+            uk = file_list[0].get("uk")
+            sign = file_list[0].get("sign")
+    if not shareid or not uk or not sign:
+        logger.error("Missing required parameters (shareid, uk, sign)")
+        return None
+    return {
+        "shareid": str(shareid),
+        "uk": str(uk),
+        "sign": sign,
+        "timestamp": str(int(time.time()))
+    }
+
+# ── Get direct download link via Terabox API ─────────────────────────
 async def get_terabox_direct_link(share_url: str) -> str | None:
-    """Extract direct download link using full API flow."""
     try:
-        # Step 1: Get dynamic parameters from share page
+        # Step 1: get dynamic parameters
         params = await get_share_params(share_url)
         if not params:
             return None
-        # Step 2: Call the list API with these parameters
+        # Step 2: call the share/list API
         api_url = "https://www.terabox.com/share/list"
         query = {
             "shareid": params["shareid"],
@@ -197,9 +216,8 @@ async def get_terabox_direct_link(share_url: str) -> str | None:
         logger.error(f"Extraction error: {e}")
         return None
 
-# ── Download using direct link or fallback ───────────────────────────
+# ── Download video (API first, then yt-dlp fallback) ─────────────────
 async def download_terabox(url, tmpdir):
-    # 1. Try to get direct link via full API flow
     direct_link = await get_terabox_direct_link(url)
     if direct_link:
         logger.info("Downloading via direct link from API")
@@ -212,10 +230,11 @@ async def download_terabox(url, tmpdir):
                 size_mb = os.path.getsize(file_path) / 1024 / 1024
                 return file_path, size_mb
             else:
-                logger.warning(f"Direct download failed with {resp.status_code}")
+                logger.warning(f"Direct download failed with {resp.status_code}, falling back")
+    else:
+        logger.warning("Could not get direct link, falling back to yt-dlp")
 
-    # 2. Fallback: yt-dlp with ndus cookie
-    logger.warning("Falling back to yt-dlp")
+    # Fallback: yt-dlp with ndus cookie
     cookie_content = f"# Netscape HTTP Cookie File\n.terabox.com\tTRUE\t/\tTRUE\t0\tndus\t{TERABOX_NDUS}\n"
     cookie_path = '/tmp/terabox_cookies.txt'
     with open(cookie_path, 'w') as f:
@@ -314,7 +333,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.from_user.username or "no_username"
     log_user(user_id, username)
 
-    if not any(domain in url for domain in ["terabox.com", "terabox.app", "1024terabox.com"]):
+    # Accept all Terabox domains
+    if not any(domain in url for domain in ["terabox.com", "terabox.app", "1024terabox.com", "1024tera.com"]):
         return
 
     start_time = time.time()
@@ -362,7 +382,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Download error: {e}")
             await status_msg.edit_text("❌ Failed. Link may be invalid or cookie expired.")
 
-# ── Keep‑alive web server (to prevent Render idle) ──────────────────
+# ── Keep-alive web server ───────────────────────────────────────────
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -384,17 +404,18 @@ def main():
     if not SHRINKFORGE_API:
         logger.warning("SHRINKFORGE_API not set – ad system disabled")
 
-    # Start keep‑alive server
+    # Keep-alive thread
     thread = threading.Thread(target=run_keep_alive, daemon=True)
     thread.start()
     logger.info(f"Keep-alive server running on port {os.environ.get('PORT', '8000')}")
 
-    # Force delete webhook to avoid conflict
+    # Delete webhook to avoid conflict
     async def del_webhook():
         async with httpx.AsyncClient() as client:
             await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook")
     asyncio.run(del_webhook())
 
+    # Start bot
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
