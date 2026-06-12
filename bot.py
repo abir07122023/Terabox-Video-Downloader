@@ -99,26 +99,67 @@ def can_use_free_video(user_id):
     count, _ = get_user_state(user_id)
     return count < 3
 
-# ── Get direct download link from Terabox using ndus cookie ──────────
-async def get_terabox_direct_link(share_url: str) -> str | None:
-    """
-    Extract direct download link using Terabox official API.
-    Supports terabox.com, terabox.app, 1024terabox.com.
-    """
-    try:
-        # Normalise URL: extract the share ID (shorturl)
-        # Example: https://1024terabox.com/s/1z6VzQEXJuGdrTCeRVvlGfA
-        match = re.search(r'/s/([a-zA-Z0-9]+)', share_url)
-        if not match:
-            logger.error(f"Cannot extract share ID from {share_url}")
+# ── Get dynamic parameters from share page ──────────────────────────
+async def get_share_params(share_url: str) -> dict | None:
+    """Extract sign, timestamp, shareid, uk from the share page."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
+        resp = await client.get(share_url, timeout=15)
+        if resp.status_code != 200:
+            logger.error(f"Failed to fetch share page: {resp.status_code}")
             return None
-        shorturl = match.group(1)
+        html = resp.text
+        # Look for the data embedded in a script tag
+        # Typical pattern: window.yourData = {...}
+        match = re.search(r'window\.yourData\s*=\s*({.+?});', html, re.DOTALL)
+        if not match:
+            # Alternative pattern
+            match = re.search(r'window\.initData\s*=\s*({.+?});', html, re.DOTALL)
+        if not match:
+            # Fallback: look for a JSON object containing shareid, uk, sign
+            match = re.search(r'"shareid"\s*:\s*(\d+).*?"uk"\s*:\s*(\d+).*?"sign"\s*:\s*"([^"]+)"', html, re.DOTALL)
+            if match:
+                shareid = match.group(1)
+                uk = match.group(2)
+                sign = match.group(3)
+                timestamp = str(int(time.time()))
+                return {"shareid": shareid, "uk": uk, "sign": sign, "timestamp": timestamp}
+            logger.error("Could not extract share parameters from page")
+            return None
+        data = json.loads(match.group(1))
+        # Navigate through the nested structure (depends on Terabox's current format)
+        share_info = data.get("shareInfo") or data.get("share") or data
+        shareid = share_info.get("shareid")
+        uk = share_info.get("uk")
+        sign = share_info.get("sign")
+        if not shareid or not uk or not sign:
+            # Try to find in list
+            file_list = data.get("fileList", [])
+            if file_list and len(file_list) > 0:
+                shareid = file_list[0].get("shareid")
+                uk = file_list[0].get("uk")
+                sign = file_list[0].get("sign")
+        if not shareid or not uk or not sign:
+            logger.error("Missing required parameters (shareid, uk, sign) in extracted data")
+            return None
+        timestamp = str(int(time.time()))
+        return {"shareid": str(shareid), "uk": str(uk), "sign": sign, "timestamp": timestamp}
 
-        # Prepare API request
+# ── Get direct download link using the extracted parameters ─────────
+async def get_terabox_direct_link(share_url: str) -> str | None:
+    """Extract direct download link using full API flow."""
+    try:
+        # Step 1: Get dynamic parameters from share page
+        params = await get_share_params(share_url)
+        if not params:
+            return None
+        # Step 2: Call the list API with these parameters
         api_url = "https://www.terabox.com/share/list"
-        params = {
-            "shorturl": shorturl,
-            "root": "1",
+        query = {
+            "shareid": params["shareid"],
+            "uk": params["uk"],
+            "sign": params["sign"],
+            "timestamp": params["timestamp"],
             "page": "1",
             "num": "100",
             "order": "time",
@@ -130,19 +171,18 @@ async def get_terabox_direct_link(share_url: str) -> str | None:
             "clienttype": "0",
         }
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0",
             "Referer": "https://www.terabox.com/",
         }
         cookies = {"ndus": TERABOX_NDUS}
-
         async with httpx.AsyncClient(cookies=cookies, timeout=10) as client:
-            resp = await client.get(api_url, params=params, headers=headers)
+            resp = await client.get(api_url, params=query, headers=headers)
             if resp.status_code != 200:
-                logger.error(f"Terabox API returned {resp.status_code}")
+                logger.error(f"API returned {resp.status_code}")
                 return None
             data = resp.json()
             if data.get("errno") != 0:
-                logger.error(f"Terabox API error: {data.get('errmsg')}")
+                logger.error(f"API error: {data.get('errmsg')} (errno {data.get('errno')})")
                 return None
             files = data.get("list", [])
             if not files:
@@ -154,15 +194,15 @@ async def get_terabox_direct_link(share_url: str) -> str | None:
                 return None
             return dlink
     except Exception as e:
-        logger.error(f"Terabox direct link extraction error: {e}")
+        logger.error(f"Extraction error: {e}")
         return None
 
 # ── Download using direct link or fallback ───────────────────────────
 async def download_terabox(url, tmpdir):
-    # 1. Try direct link via Terabox API
+    # 1. Try to get direct link via full API flow
     direct_link = await get_terabox_direct_link(url)
     if direct_link:
-        logger.info("Downloading via direct link")
+        logger.info("Downloading via direct link from API")
         async with httpx.AsyncClient() as client:
             resp = await client.get(direct_link, timeout=90, follow_redirects=True)
             if resp.status_code == 200:
@@ -172,11 +212,10 @@ async def download_terabox(url, tmpdir):
                 size_mb = os.path.getsize(file_path) / 1024 / 1024
                 return file_path, size_mb
             else:
-                logger.warning(f"Direct download returned {resp.status_code}, falling back to yt-dlp")
-    else:
-        logger.warning("Could not get direct link, falling back to yt-dlp")
+                logger.warning(f"Direct download failed with {resp.status_code}")
 
     # 2. Fallback: yt-dlp with ndus cookie
+    logger.warning("Falling back to yt-dlp")
     cookie_content = f"# Netscape HTTP Cookie File\n.terabox.com\tTRUE\t/\tTRUE\t0\tndus\t{TERABOX_NDUS}\n"
     cookie_path = '/tmp/terabox_cookies.txt'
     with open(cookie_path, 'w') as f:
@@ -350,14 +389,18 @@ def main():
     thread.start()
     logger.info(f"Keep-alive server running on port {os.environ.get('PORT', '8000')}")
 
-    # Telegram bot
+    # Force delete webhook to avoid conflict
+    async def del_webhook():
+        async with httpx.AsyncClient() as client:
+            await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook")
+    asyncio.run(del_webhook())
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
     logger.info("Bot started, polling...")
-    # Use drop_pending_updates=True to avoid old updates causing conflicts
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
