@@ -1,8 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          TERABOX TELEGRAM BOT — FAST & WORKING VERSION           ║
-║          Uses external API for reliability                       ║
-║          @Terabox_Linkto_Video_bot                               ║
+║      TERABOX TELEGRAM BOT — FINAL CONFLICT-FREE VERSION          ║
+║                                                                  ║
+║  • Uses external API for download (no yt-dlp)                   ║
+║  • Deletes webhook and waits before polling                     ║
+║  • Freemium: 3 free / 12h, ad unlock (ShrinkForge)              ║
+║  • Keep-alive server for Render                                 ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -26,19 +29,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────
-# ENVIRONMENT VARIABLES (set these in Render)
-# ─────────────────────────────────────────────
+# ================== ENVIRONMENT VARIABLES ==================
 BOT_TOKEN       = os.environ.get("BOT_TOKEN")
-TERABOX_NDUS    = os.environ.get("TERABOX_NDUS")      # Your ndus cookie
+TERABOX_NDUS    = os.environ.get("TERABOX_NDUS")
 LOG_CHANNEL_ID  = int(os.environ.get("LOG_CHANNEL_ID", "-1003956558170"))
 ADMIN_ID        = int(os.environ.get("ADMIN_ID", "6294267891"))
-SHRINKFORGE_API = os.environ.get("SHRINKFORGE_API", "")  # optional, for ads
+SHRINKFORGE_API = os.environ.get("SHRINKFORGE_API", "")
 BOT_USERNAME    = "Terabox_Linkto_Video_bot"
 
-# Freemium constants
 FREE_LIMIT      = 3
-WINDOW_SECONDS  = 12 * 3600      # 12 hours
+WINDOW_SECONDS  = 12 * 3600
 UNLOCK_SECONDS  = 12 * 3600
 
 USER_DATA_FILE  = "/tmp/terabox_user_data.json"
@@ -55,6 +55,7 @@ TERABOX_DOMAINS = ["terabox.com", "1024terabox.com", "terabox.app", "teraboxapp.
 def is_terabox_url(url: str) -> bool:
     return any(domain in url for domain in TERABOX_DOMAINS)
 
+# ================== USER DATA ==================
 def load_user_data() -> dict:
     try:
         with open(USER_DATA_FILE, "r") as f:
@@ -103,7 +104,6 @@ def get_user_status(user_id: int) -> dict:
     count = entry.get("count", 0)
     remaining = max(0, FREE_LIMIT - count)
     reset_in = max(0, int(WINDOW_SECONDS - (now - window_start)))
-
     return {"can_download": remaining > 0, "is_unlocked": False, "remaining": remaining, "reset_in": reset_in}
 
 def increment_download_count(user_id: int) -> None:
@@ -129,6 +129,7 @@ def unlock_user(user_id: int) -> None:
     data[uid] = entry
     save_user_data(data)
 
+# ================== AD SYSTEM ==================
 def generate_verify_token(user_id: int) -> str:
     token = uuid.uuid4().hex[:16].upper()
     pending_tokens[token] = {"user_id": user_id, "expires": time.time() + 3600}
@@ -160,22 +161,21 @@ async def create_ad_link(deep_link: str) -> str:
         logger.error(f"ShrinkForge error: {e}")
     return deep_link
 
-# ────── THE FIXED DOWNLOADER USING EXTERNAL API ──────
+# ================== TERABOX DOWNLOAD ==================
 async def download_terabox_video(share_url: str) -> Optional[str]:
-    """Uses the pika-terabox-dl.vercel.app API to get the direct download link."""
+    """Use external API for reliable download."""
     try:
-        # Call the reliable external API (no cookie needed for this API)
         api_url = f"https://pika-terabox-dl.vercel.app/?url={share_url}"
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(api_url)
             if resp.status_code != 200:
-                logger.error(f"API returned {resp.status_code}")
+                logger.error(f"API error {resp.status_code}")
                 return None
             data = resp.json()
             if data.get("ok") and data.get("downloadLink"):
                 direct_link = data["downloadLink"]
                 out_path = os.path.join(DOWNLOAD_DIR, f"{uuid.uuid4().hex}.mp4")
-                async with httpx.AsyncClient(headers={"Referer": "https://www.terabox.com/"}, follow_redirects=True, timeout=300) as dl_client:
+                async with httpx.AsyncClient(follow_redirects=True, timeout=300) as dl_client:
                     async with dl_client.stream("GET", direct_link) as r:
                         r.raise_for_status()
                         with open(out_path, "wb") as f:
@@ -187,6 +187,7 @@ async def download_terabox_video(share_url: str) -> Optional[str]:
         logger.error(f"Download error: {e}")
     return None
 
+# ================== LOG CHANNEL ==================
 async def log_to_channel(context: ContextTypes.DEFAULT_TYPE, user, message_text: str, bot_reply: str):
     try:
         user_info = f"👤 {user.full_name} (@{user.username or 'no_username'}) [ID: {user.id}]"
@@ -195,6 +196,7 @@ async def log_to_channel(context: ContextTypes.DEFAULT_TYPE, user, message_text:
     except Exception as e:
         logger.warning(f"Log channel error: {e}")
 
+# ================== TELEGRAM HANDLERS ==================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
@@ -315,6 +317,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Unhandled error: {context.error}", exc_info=context.error)
 
+# ================== KEEP-ALIVE SERVER ==================
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -328,13 +331,28 @@ def run_keep_alive():
     server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     server.serve_forever()
 
+# ================== MAIN ==================
+async def delete_webhook_and_wait():
+    async with httpx.AsyncClient() as client:
+        await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook")
+    # Wait 3 seconds to ensure Telegram clears the old session
+    await asyncio.sleep(3)
+
 def main():
     if not BOT_TOKEN or not TERABOX_NDUS:
         logger.error("BOT_TOKEN or TERABOX_NDUS not set!")
         return
 
+    # Start keep-alive thread
     threading.Thread(target=run_keep_alive, daemon=True).start()
 
+    # Force delete webhook and wait before polling
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(delete_webhook_and_wait())
+    loop.close()
+
+    # Build application
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stats", cmd_stats))
@@ -342,7 +360,12 @@ def main():
     app.add_error_handler(error_handler)
 
     logger.info("Starting polling...")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    # Use a longer timeout and drop pending updates
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+        pool_timeout=30,
+    )
 
 if __name__ == "__main__":
     main()
