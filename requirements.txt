@@ -1,2 +1,3 @@
 python-telegram-bot[job-queue]==22.6
 httpx
+yt-dlp>=2025.01.15
