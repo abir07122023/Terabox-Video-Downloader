@@ -1,13 +1,12 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          TERABOX TELEGRAM BOT — FINAL WORKING VERSION            ║
-║          Uses official Terabox API with cookie                   ║
+║          TERABOX TELEGRAM BOT — FAST & WORKING VERSION           ║
+║          Uses external API for reliability                       ║
 ║          @Terabox_Linkto_Video_bot                               ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
 import os
-import re
 import json
 import time
 import uuid
@@ -28,13 +27,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-# ENVIRONMENT VARIABLES (set in Render)
+# ENVIRONMENT VARIABLES (set these in Render)
 # ─────────────────────────────────────────────
 BOT_TOKEN       = os.environ.get("BOT_TOKEN")
-TERABOX_NDUS    = os.environ.get("TERABOX_NDUS")
+TERABOX_NDUS    = os.environ.get("TERABOX_NDUS")      # Your ndus cookie
 LOG_CHANNEL_ID  = int(os.environ.get("LOG_CHANNEL_ID", "-1003956558170"))
 ADMIN_ID        = int(os.environ.get("ADMIN_ID", "6294267891"))
-SHRINKFORGE_API = os.environ.get("SHRINKFORGE_API", "")  # optional
+SHRINKFORGE_API = os.environ.get("SHRINKFORGE_API", "")  # optional, for ads
 BOT_USERNAME    = "Terabox_Linkto_Video_bot"
 
 # Freemium constants
@@ -42,7 +41,6 @@ FREE_LIMIT      = 3
 WINDOW_SECONDS  = 12 * 3600      # 12 hours
 UNLOCK_SECONDS  = 12 * 3600
 
-# File paths
 USER_DATA_FILE  = "/tmp/terabox_user_data.json"
 USERS_LOG_FILE  = "/tmp/terabox_users.txt"
 DOWNLOAD_DIR    = "/tmp/terabox_downloads"
@@ -50,21 +48,13 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 pending_tokens = {}
 
-# Browser headers
-BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+TERABOX_DOMAINS = ["terabox.com", "1024terabox.com", "terabox.app", "teraboxapp.com",
+                   "nephobox.com", "freeterabox.com", "mirrobox.com", "momerybox.com",
+                   "tibibox.com", "1024tera.com"]
 
-TERABOX_DOMAINS = [
-    "terabox.com", "1024terabox.com", "terabox.app", "teraboxapp.com",
-    "nephobox.com", "freeterabox.com", "mirrobox.com", "momerybox.com",
-    "tibibox.com", "1024tera.com",
-]
+def is_terabox_url(url: str) -> bool:
+    return any(domain in url for domain in TERABOX_DOMAINS)
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 1: USER DATA (unchanged)
-# ══════════════════════════════════════════════════════════════════
 def load_user_data() -> dict:
     try:
         with open(USER_DATA_FILE, "r") as f:
@@ -139,120 +129,6 @@ def unlock_user(user_id: int) -> None:
     data[uid] = entry
     save_user_data(data)
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 2: TERABOX EXTRACTION (Official API method)
-# ══════════════════════════════════════════════════════════════════
-def is_terabox_url(url: str) -> bool:
-    return any(domain in url for domain in TERABOX_DOMAINS)
-
-async def extract_direct_link(share_url: str) -> Optional[str]:
-    """Extract direct download link using official Terabox API."""
-    # Step 1: Get the final page after redirects with ndus cookie
-    cookies = {"ndus": TERABOX_NDUS}
-    async with httpx.AsyncClient(cookies=cookies, headers=BROWSER_HEADERS, follow_redirects=True, timeout=30) as client:
-        # Fetch the share page to get the short URL and other parameters
-        resp = await client.get(share_url)
-        if resp.status_code != 200:
-            logger.error(f"Failed to fetch share page: {resp.status_code}")
-            return None
-        final_url = str(resp.url)
-        html = resp.text
-
-        # Extract surl from URL (the part after /s/)
-        surl_match = re.search(r"/s/([A-Za-z0-9_\-]+)", final_url)
-        if not surl_match:
-            surl_match = re.search(r"surl=([A-Za-z0-9_\-]+)", final_url)
-        if not surl_match:
-            logger.error("Could not extract surl")
-            return None
-        surl = surl_match.group(1)
-
-        # Extract shareid, uk, sign from the page (embedded in window.yunData)
-        # Look for a JSON object containing these fields
-        json_pattern = r'window\.yunData\s*=\s*({.*?});'
-        match = re.search(json_pattern, html, re.DOTALL)
-        if not match:
-            # Alternative pattern for newer pages
-            json_pattern = r'data-share-id="([^"]+)" data-uk="([^"]+)" data-sign="([^"]+)"'
-            alt_match = re.search(json_pattern, html)
-            if alt_match:
-                shareid = alt_match.group(1)
-                uk = alt_match.group(2)
-                sign = alt_match.group(3)
-            else:
-                logger.error("Could not extract shareid/uk/sign from page")
-                return None
-        else:
-            try:
-                yun_data = json.loads(match.group(1))
-                shareid = yun_data.get("shareid")
-                uk = yun_data.get("uk")
-                sign = yun_data.get("sign")
-            except:
-                logger.error("Failed to parse yunData JSON")
-                return None
-
-        if not shareid or not uk or not sign:
-            logger.error("Missing shareid/uk/sign")
-            return None
-
-        # Step 2: Call the share/list API
-        api_url = "https://www.terabox.com/share/list"
-        params = {
-            "shorturl": surl,
-            "shareid": shareid,
-            "uk": uk,
-            "sign": sign,
-            "page": "1",
-            "num": "20",
-            "order": "time",
-            "desc": "1",
-            "app_id": "250528",
-            "web": "1",
-            "channel": "dubox",
-            "clienttype": "0",
-        }
-        headers = {"Referer": final_url, "X-Requested-With": "XMLHttpRequest"}
-        api_resp = await client.get(api_url, params=params, headers=headers)
-        if api_resp.status_code != 200:
-            logger.error(f"API request failed: {api_resp.status_code}")
-            return None
-        api_data = api_resp.json()
-        if api_data.get("errno") != 0:
-            logger.error(f"API error: {api_data.get('errmsg')}")
-            return None
-        file_list = api_data.get("list", [])
-        if not file_list:
-            logger.error("No files in API response")
-            return None
-        # Get the first file's dlink
-        dlink = file_list[0].get("dlink")
-        if not dlink:
-            logger.error("No dlink in API response")
-            return None
-        return dlink
-
-async def download_terabox_video(share_url: str) -> Optional[str]:
-    """Get direct link and download the video."""
-    direct_link = await extract_direct_link(share_url)
-    if not direct_link:
-        return None
-    # Prepare output file
-    out_path = os.path.join(DOWNLOAD_DIR, f"{uuid.uuid4().hex}.mp4")
-    headers = {**BROWSER_HEADERS, "Referer": "https://www.terabox.com/"}
-    async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=300) as client:
-        async with client.stream("GET", direct_link) as resp:
-            resp.raise_for_status()
-            with open(out_path, "wb") as f:
-                async for chunk in resp.aiter_bytes(chunk_size=8192):
-                    f.write(chunk)
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-        return out_path
-    return None
-
-# ══════════════════════════════════════════════════════════════════
-# SECTION 3: AD SYSTEM (SHRINKFORGE – OPTIONAL)
-# ══════════════════════════════════════════════════════════════════
 def generate_verify_token(user_id: int) -> str:
     token = uuid.uuid4().hex[:16].upper()
     pending_tokens[token] = {"user_id": user_id, "expires": time.time() + 3600}
@@ -284,9 +160,33 @@ async def create_ad_link(deep_link: str) -> str:
         logger.error(f"ShrinkForge error: {e}")
     return deep_link
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 4: LOG CHANNEL
-# ══════════════════════════════════════════════════════════════════
+# ────── THE FIXED DOWNLOADER USING EXTERNAL API ──────
+async def download_terabox_video(share_url: str) -> Optional[str]:
+    """Uses the pika-terabox-dl.vercel.app API to get the direct download link."""
+    try:
+        # Call the reliable external API (no cookie needed for this API)
+        api_url = f"https://pika-terabox-dl.vercel.app/?url={share_url}"
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(api_url)
+            if resp.status_code != 200:
+                logger.error(f"API returned {resp.status_code}")
+                return None
+            data = resp.json()
+            if data.get("ok") and data.get("downloadLink"):
+                direct_link = data["downloadLink"]
+                out_path = os.path.join(DOWNLOAD_DIR, f"{uuid.uuid4().hex}.mp4")
+                async with httpx.AsyncClient(headers={"Referer": "https://www.terabox.com/"}, follow_redirects=True, timeout=300) as dl_client:
+                    async with dl_client.stream("GET", direct_link) as r:
+                        r.raise_for_status()
+                        with open(out_path, "wb") as f:
+                            async for chunk in r.aiter_bytes(chunk_size=8192):
+                                f.write(chunk)
+                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    return out_path
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+    return None
+
 async def log_to_channel(context: ContextTypes.DEFAULT_TYPE, user, message_text: str, bot_reply: str):
     try:
         user_info = f"👤 {user.full_name} (@{user.username or 'no_username'}) [ID: {user.id}]"
@@ -295,9 +195,6 @@ async def log_to_channel(context: ContextTypes.DEFAULT_TYPE, user, message_text:
     except Exception as e:
         logger.warning(f"Log channel error: {e}")
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 5: TELEGRAM HANDLERS
-# ══════════════════════════════════════════════════════════════════
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
@@ -418,9 +315,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Unhandled error: {context.error}", exc_info=context.error)
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 6: KEEP-ALIVE WEB SERVER
-# ══════════════════════════════════════════════════════════════════
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -434,9 +328,6 @@ def run_keep_alive():
     server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     server.serve_forever()
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 7: MAIN
-# ══════════════════════════════════════════════════════════════════
 def main():
     if not BOT_TOKEN or not TERABOX_NDUS:
         logger.error("BOT_TOKEN or TERABOX_NDUS not set!")
