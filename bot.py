@@ -12,7 +12,6 @@ import json
 import time
 import uuid
 import random
-import asyncio
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -32,10 +31,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN       = os.environ.get("BOT_TOKEN")
 LOG_CHANNEL_ID  = int(os.environ.get("LOG_CHANNEL_ID", "-1003956558170"))
 ADMIN_ID        = int(os.environ.get("ADMIN_ID", "6294267891"))
-SHRINKFORGE_API = os.environ.get("SHRINKFORGE_API", "")      # optional, for ads
+SHRINKFORGE_API = os.environ.get("SHRINKFORGE_API", "")
 BOT_USERNAME    = "Terabox_Linkto_Video_bot"
 
-# Freemium constants
 FREE_LIMIT      = 3
 WINDOW_SECONDS  = 12 * 3600
 UNLOCK_SECONDS  = 12 * 3600
@@ -53,14 +51,13 @@ TERABOX_DOMAINS = [
     "tibibox.com", "1024tera.com"
 ]
 
-# Browser headers for requests
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.terabox.app/",
 }
 
-# ================== USER DATA PERSISTENCE ==================
+# ================== USER DATA ==================
 def load_user_data() -> dict:
     try:
         with open(USER_DATA_FILE, "r") as f:
@@ -95,17 +92,14 @@ def get_user_status(user_id: int) -> dict:
     uid = str(user_id)
     now = time.time()
     entry = data.get(uid, {"count": 0, "window_start": now, "unlock_until": 0})
-
     if entry.get("unlock_until", 0) > now:
         return {"can_download": True, "is_unlocked": True, "remaining": 999, "reset_in": 0}
-
     window_start = entry.get("window_start", now)
     if now - window_start >= WINDOW_SECONDS:
         entry["count"] = 0
         entry["window_start"] = now
         data[uid] = entry
         save_user_data(data)
-
     count = entry.get("count", 0)
     remaining = max(0, FREE_LIMIT - count)
     reset_in = max(0, int(WINDOW_SECONDS - (now - window_start)))
@@ -134,7 +128,7 @@ def unlock_user(user_id: int) -> None:
     data[uid] = entry
     save_user_data(data)
 
-# ================== AD SYSTEM (SHRINKFORGE) ==================
+# ================== AD SYSTEM ==================
 def generate_verify_token(user_id: int) -> str:
     token = uuid.uuid4().hex[:16].upper()
     pending_tokens[token] = {"user_id": user_id, "expires": time.time() + 3600}
@@ -166,17 +160,11 @@ async def create_shrinkforge_link(deep_link: str) -> str:
         logger.error(f"ShrinkForge error: {e}")
     return deep_link
 
-# ================== TERABOX EXTRACTION (WORKING API) ==================
+# ================== TERABOX EXTRACTION ==================
 def is_terabox_url(url: str) -> bool:
     return any(domain in url for domain in TERABOX_DOMAINS)
 
 async def extract_terabox_info(share_url: str) -> Optional[dict]:
-    """
-    Extract surl, jsToken, pcftoken from share page,
-    then call the official shorturlinfo API.
-    Returns dict with dlink, filename, size or None.
-    """
-    # Step 1: Get the surl from the URL
     surl_match = re.search(r'/s/([A-Za-z0-9_\-]+)', share_url)
     if not surl_match:
         surl_match = re.search(r'surl=([A-Za-z0-9_\-]+)', share_url)
@@ -185,7 +173,6 @@ async def extract_terabox_info(share_url: str) -> Optional[dict]:
         return None
     surl = surl_match.group(1)
 
-    # Step 2: Fetch share page to get jsToken and pcftoken
     fetch_url = f"https://www.terabox.app/sharing/link?surl={surl}"
     async with httpx.AsyncClient(headers=BROWSER_HEADERS, follow_redirects=True, timeout=30) as client:
         resp = await client.get(fetch_url)
@@ -193,24 +180,11 @@ async def extract_terabox_info(share_url: str) -> Optional[dict]:
             logger.error(f"Failed to fetch share page: {resp.status_code}")
             return None
         html = resp.text
-
-        # Extract jsToken from HTML (common pattern)
         js_token_match = re.search(r'jsToken\s*[=:]\s*["\']([^"\']+)["\']', html)
         js_token = js_token_match.group(1) if js_token_match else ""
-
-        # Extract pcftoken (sometimes called pscftoken or similar)
         pcftoken_match = re.search(r'pcftoken\s*[=:]\s*["\']([^"\']+)["\']', html)
         pcftoken = pcftoken_match.group(1) if pcftoken_match else "0"
 
-        # Also try to get shareid/uk/sign from the page (optional, used for other endpoints)
-        shareid_match = re.search(r'shareid["\']\s*:\s*(\d+)', html)
-        uk_match = re.search(r'uk["\']\s*:\s*(\d+)', html)
-        sign_match = re.search(r'sign["\']\s*:\s*"([^"]+)"', html)
-        shareid = shareid_match.group(1) if shareid_match else ""
-        uk = uk_match.group(1) if uk_match else ""
-        sign = sign_match.group(1) if sign_match else ""
-
-    # Step 3: Call the official API
     api_url = "https://www.terabox.app/api/shorturlinfo"
     params = {
         "clientfrom": "h5",
@@ -233,37 +207,29 @@ async def extract_terabox_info(share_url: str) -> Optional[dict]:
             logger.error(f"API returned {resp.status_code}")
             return None
         data = resp.json()
-
     if data.get("errno") != 0:
         logger.error(f"API error: {data.get('errmsg')}")
         return None
-
     file_list = data.get("list", [])
     if not file_list:
         logger.error("No files in API response")
         return None
-
     file_info = file_list[0]
     dlink = file_info.get("dlink")
     if not dlink:
-        # If dlink is empty, we may need a second call (getplayurl) – but dlink works in most cases.
-        logger.error("dlink is empty; cannot download")
+        logger.error("dlink is empty")
         return None
-
     filename = file_info.get("server_filename", "video.mp4")
     size = int(file_info.get("size", 0))
     return {"dlink": dlink, "filename": filename, "size": size}
 
 async def download_terabox_video(share_url: str) -> Optional[str]:
-    """Extract info and download the video."""
     info = await extract_terabox_info(share_url)
     if not info:
         return None
-
     dlink = info["dlink"]
     filename = re.sub(r'[^\w\s\-.]', '_', info["filename"]).strip(" .")
     out_path = os.path.join(DOWNLOAD_DIR, f"{uuid.uuid4().hex}_{filename}")
-
     logger.info(f"Downloading from dlink: {dlink[:80]}...")
     try:
         async with httpx.AsyncClient(headers=BROWSER_HEADERS, follow_redirects=True, timeout=300) as client:
@@ -297,8 +263,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id
     log_user(user_id)
     args = context.args
-
-    # Handle ad verification deep link
     if args and args[0].startswith("verify_"):
         parts = args[0].split("_")
         if len(parts) >= 3:
@@ -314,7 +278,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text("❌ Invalid or expired token.")
         return
-
     status = get_user_status(user_id)
     welcome = (
         f"👋 Welcome, *{user.first_name}*!\n\n"
@@ -339,14 +302,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     text = update.message.text.strip()
-
     if not is_terabox_url(text):
         await update.message.reply_text(
             "🔗 Please send a valid Terabox link.\nSupported: `terabox.com`, `1024terabox.com`, `terabox.app`, etc.",
             parse_mode="Markdown"
         )
         return
-
     status = get_user_status(user_id)
     if not status["can_download"]:
         token = generate_verify_token(user_id)
@@ -365,28 +326,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(limit_msg, parse_mode="Markdown", reply_markup=keyboard)
         await log_to_channel(context, user, text, "Limit reached — ad link sent")
         return
-
     processing_msg = await update.message.reply_text("⬇️ *Downloading your video...* ⏳", parse_mode="Markdown")
     file_path = None
     try:
         file_path = await download_terabox_video(text)
         if not file_path or not os.path.exists(file_path):
             raise FileNotFoundError("No output file")
-
         size_mb = os.path.getsize(file_path) / 1024 / 1024
         if size_mb > 49:
             await processing_msg.edit_text(f"⚠️ File too large ({size_mb:.1f} MB) > 50 MB limit.")
             return
-
         if not status["is_unlocked"]:
             increment_download_count(user_id)
-
         await processing_msg.edit_text("📤 *Uploading to Telegram...*", parse_mode="Markdown")
         caption = f"🎬 *{os.path.basename(file_path)}*\n📦 Size: {size_mb:.1f} MB\n\n_Downloaded by @{BOT_USERNAME}_"
         with open(file_path, "rb") as f:
             await update.message.reply_video(video=f, caption=caption, parse_mode="Markdown", supports_streaming=True)
         await processing_msg.delete()
-
         new_status = get_user_status(user_id)
         if not new_status["is_unlocked"]:
             remaining_text = f"📊 Downloads remaining: {new_status['remaining']}/{FREE_LIMIT}"
@@ -395,7 +351,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             remaining_text = f"🔓 Unlimited — {h}h left"
         await update.message.reply_text(remaining_text)
         await log_to_channel(context, user, text, f"Video sent ✅ ({size_mb:.1f} MB)")
-
     except Exception as e:
         logger.error(f"Download error: {e}", exc_info=True)
         await processing_msg.edit_text(
@@ -432,24 +387,13 @@ def run_keep_alive():
     server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     server.serve_forever()
 
-# ================== MAIN ==================
-async def delete_webhook():
-    async with httpx.AsyncClient() as client:
-        await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook")
-
+# ================== MAIN (FIXED) ==================
 def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN not set!")
         return
-
-    # Start keep-alive thread
+    # Start keep-alive server in background thread
     threading.Thread(target=run_keep_alive, daemon=True).start()
-
-    # Delete webhook to avoid conflicts
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(delete_webhook())
-    loop.close()
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -458,6 +402,7 @@ def main():
     app.add_error_handler(error_handler)
 
     logger.info("Starting polling...")
+    # run_polling will create its own event loop; no manual loop needed
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
