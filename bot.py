@@ -1,11 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║      TERABOX TELEGRAM BOT — FINAL CONFLICT-FREE VERSION          ║
-║                                                                  ║
-║  • Uses external API for download (no yt-dlp)                   ║
-║  • Deletes webhook and waits before polling                     ║
-║  • Freemium: 3 free / 12h, ad unlock (ShrinkForge)              ║
-║  • Keep-alive server for Render                                 ║
+║           TERABOX TELEGRAM BOT — WORKING WITH FREE API           ║
+║          Uses the official tera-api worker (no cookies)          ║
+║          @Terabox_Linkto_Video_bot                               ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -31,16 +28,19 @@ logger = logging.getLogger(__name__)
 
 # ================== ENVIRONMENT VARIABLES ==================
 BOT_TOKEN       = os.environ.get("BOT_TOKEN")
-TERABOX_NDUS    = os.environ.get("TERABOX_NDUS")
+# TERABOX_NDUS is no longer required for the main downloader
+# We keep it in case you want to re-add ShrinkForge ads later
 LOG_CHANNEL_ID  = int(os.environ.get("LOG_CHANNEL_ID", "-1003956558170"))
 ADMIN_ID        = int(os.environ.get("ADMIN_ID", "6294267891"))
 SHRINKFORGE_API = os.environ.get("SHRINKFORGE_API", "")
 BOT_USERNAME    = "Terabox_Linkto_Video_bot"
 
+# Freemium constants
 FREE_LIMIT      = 3
-WINDOW_SECONDS  = 12 * 3600
+WINDOW_SECONDS  = 12 * 3600      # 12 hours
 UNLOCK_SECONDS  = 12 * 3600
 
+# File paths
 USER_DATA_FILE  = "/tmp/terabox_user_data.json"
 USERS_LOG_FILE  = "/tmp/terabox_users.txt"
 DOWNLOAD_DIR    = "/tmp/terabox_downloads"
@@ -129,7 +129,7 @@ def unlock_user(user_id: int) -> None:
     data[uid] = entry
     save_user_data(data)
 
-# ================== AD SYSTEM ==================
+# ================== AD SYSTEM (optional) ==================
 def generate_verify_token(user_id: int) -> str:
     token = uuid.uuid4().hex[:16].upper()
     pending_tokens[token] = {"user_id": user_id, "expires": time.time() + 3600}
@@ -161,31 +161,60 @@ async def create_ad_link(deep_link: str) -> str:
         logger.error(f"ShrinkForge error: {e}")
     return deep_link
 
-# ================== TERABOX DOWNLOAD ==================
+# ================== TERABOX DOWNLOAD (WORKING FREE API) ==================
 async def download_terabox_video(share_url: str) -> Optional[str]:
-    """Use external API for reliable download."""
+    """Use the official tera-api (free) to get direct download link and download the video."""
     try:
-        api_url = f"https://pika-terabox-dl.vercel.app/?url={share_url}"
+        # The official, free API endpoint that does NOT require cookies
+        api_url = f"https://terabox-worker.robinkumarshakya103.workers.dev/api?url={share_url}"
+        logger.info(f"Contacting API: {api_url}")
+        
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(api_url)
+            logger.info(f"API response status: {resp.status_code}")
+            
             if resp.status_code != 200:
-                logger.error(f"API error {resp.status_code}")
+                logger.error(f"API returned {resp.status_code}")
                 return None
+                
             data = resp.json()
-            if data.get("ok") and data.get("downloadLink"):
-                direct_link = data["downloadLink"]
+            logger.info(f"API response structure: {list(data.keys())}")
+            
+            # Check if the API returned a successful response with files
+            if data.get("success") and data.get("files"):
+                file_info = data["files"][0]  # Get the first file
+                direct_link = file_info.get("download_url")
+                filename = file_info.get("file_name", "video.mp4")
+                
+                if not direct_link:
+                    logger.error("No download_url in API response")
+                    return None
+                    
                 out_path = os.path.join(DOWNLOAD_DIR, f"{uuid.uuid4().hex}.mp4")
+                logger.info(f"Downloading from: {direct_link[:80]}...")
+                
+                # Download the file
                 async with httpx.AsyncClient(follow_redirects=True, timeout=300) as dl_client:
                     async with dl_client.stream("GET", direct_link) as r:
                         r.raise_for_status()
                         with open(out_path, "wb") as f:
                             async for chunk in r.aiter_bytes(chunk_size=8192):
                                 f.write(chunk)
+                
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                    logger.info(f"Download complete: {out_path}")
                     return out_path
+                else:
+                    logger.error("Downloaded file is empty or missing")
+                    return None
+            else:
+                error_msg = data.get("error", "Unknown error from API")
+                logger.error(f"API error: {error_msg}")
+                return None
+                
     except Exception as e:
-        logger.error(f"Download error: {e}")
-    return None
+        logger.error(f"Download error: {e}", exc_info=True)
+        return None
 
 # ================== LOG CHANNEL ==================
 async def log_to_channel(context: ContextTypes.DEFAULT_TYPE, user, message_text: str, bot_reply: str):
@@ -303,7 +332,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Download error: {e}", exc_info=True)
         await processing_msg.edit_text(
-            "❌ *Download failed.*\n\nPossible reasons:\n• Link private or expired\n• Terabox blocked the request\n• File not video",
+            "❌ *Download failed.*\n\n"
+            "Possible reasons:\n"
+            "• The API is currently rate-limited\n"
+            "• The link is private or expired\n"
+            "• Terabox blocked the request\n\n"
+            "Please try again in a few minutes or try a different link.",
             parse_mode="Markdown"
         )
         await log_to_channel(context, user, text, f"Error: {str(e)[:200]}")
@@ -335,24 +369,20 @@ def run_keep_alive():
 async def delete_webhook_and_wait():
     async with httpx.AsyncClient() as client:
         await client.post(f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook")
-    # Wait 3 seconds to ensure Telegram clears the old session
     await asyncio.sleep(3)
 
 def main():
-    if not BOT_TOKEN or not TERABOX_NDUS:
-        logger.error("BOT_TOKEN or TERABOX_NDUS not set!")
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN not set!")
         return
 
-    # Start keep-alive thread
     threading.Thread(target=run_keep_alive, daemon=True).start()
 
-    # Force delete webhook and wait before polling
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(delete_webhook_and_wait())
     loop.close()
 
-    # Build application
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stats", cmd_stats))
@@ -360,11 +390,10 @@ def main():
     app.add_error_handler(error_handler)
 
     logger.info("Starting polling...")
-    # Use a longer timeout and drop pending updates
+    # The 'pool_timeout' argument was removed as it's not compatible with your library version
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
-        pool_timeout=30,
     )
 
 if __name__ == "__main__":
