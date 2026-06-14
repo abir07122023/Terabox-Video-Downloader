@@ -1,9 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║          TERABOX TELEGRAM BOT — FINAL WORKING VERSION            ║
-║          @Terabox_Linkto_Video_bot                               ║
+║             TERABOX TELEGRAM BOT — STABLE VERSION                ║
+║                     @Terabox_Linkto_Video_bot                    ║
 ║                                                                  ║
-║  Uses yt-dlp + ndus cookie to download reliably.                ║
+║  Uses simple HTML extraction, not yt-dlp.                       ║
 ║  Freemium: 3 free / 12h sliding window.                         ║
 ║  ShrinkForge ad unlock (optional).                               ║
 ║  Log channel, admin stats, keep-alive server.                   ║
@@ -20,15 +20,14 @@ import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
-
+import requests
 import httpx
-import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------
 # LOGGING & CONFIGURATION
-# ─────────────────────────────────────────────
+# -----------------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
@@ -57,7 +56,7 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 # In-memory pending tokens for ad verification
 pending_tokens = {}
 
-# Browser headers for yt-dlp
+# Browser headers for HTTP requests
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept-Language": "en-US,en;q=0.9",
@@ -71,10 +70,9 @@ TERABOX_DOMAINS = [
     "tibibox.com", "1024tera.com",
 ]
 
-# ══════════════════════════════════════════════════════════════════
+# -----------------------------------------------------------------
 # SECTION 1: USER DATA PERSISTENCE
-# ══════════════════════════════════════════════════════════════════
-
+# -----------------------------------------------------------------
 def load_user_data() -> dict:
     try:
         with open(USER_DATA_FILE, "r") as f:
@@ -110,7 +108,6 @@ def get_user_status(user_id: int) -> dict:
     now = time.time()
     entry = data.get(uid, {"count": 0, "window_start": now, "unlock_until": 0})
 
-    # Check if ad-unlock is active
     if entry.get("unlock_until", 0) > now:
         return {"can_download": True, "is_unlocked": True, "remaining": 999, "reset_in": 0}
 
@@ -150,63 +147,80 @@ def unlock_user(user_id: int) -> None:
     data[uid] = entry
     save_user_data(data)
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 2: TERABOX DOWNLOAD USING YT-DLP + COOKIE
-# ══════════════════════════════════════════════════════════════════
-
+# -----------------------------------------------------------------
+# SECTION 2: TERABOX VIDEO EXTRACTION (NO yt-dlp)
+# -----------------------------------------------------------------
 def is_terabox_url(url: str) -> bool:
     return any(domain in url for domain in TERABOX_DOMAINS)
 
+def get_terabox_direct_link(share_url: str) -> Optional[str]:
+    """
+    Extract the direct video download link from a Terabox page.
+    Uses requests and a regex pattern, as used in many working bots.
+    """
+    cookies = None
+    if TERABOX_NDUS:
+        cookies = {"ndus": TERABOX_NDUS}
+    try:
+        # Use a session to handle redirects
+        session = requests.Session()
+        # Prepare cookies
+        if cookies:
+            session.cookies.update(cookies)
+        # First, fetch the page with the main browser headers
+        response = session.get(share_url, headers=BROWSER_HEADERS, timeout=30)
+        response.raise_for_status()
+        
+        # The direct download link pattern used by many bots
+        pattern = r'(https?://download\.(terabox|1024terabox)\.com[^"\']+)'
+        match = re.search(pattern, response.text)
+        if match:
+            return match.group(1)
+        # Fallback pattern for other domains like terabox.club
+        pattern2 = r'(https?://[^"\']+\.terabox\.[^"\']+\.(?:mp4|mkv|webm|zip|rar))'
+        match2 = re.search(pattern2, response.text)
+        if match2:
+            return match2.group(1)
+        logger.error("Could not extract download link from HTML")
+        return None
+    except Exception as e:
+        logger.error(f"Extraction error: {e}")
+        return None
+
 async def download_terabox_video(share_url: str) -> Optional[str]:
     """
-    Download Terabox video using yt-dlp with the ndus cookie.
+    Downloads the video using the direct link obtained from the HTML.
     Returns path to downloaded file or None.
     """
-    # Create a temporary cookies.txt file from ndus
-    cookie_content = f"# Netscape HTTP Cookie File\n.terabox.com\tTRUE\t/\tTRUE\t0\tndus\t{TERABOX_NDUS}\n"
-    cookie_path = "/tmp/terabox_cookies.txt"
-    with open(cookie_path, "w") as f:
-        f.write(cookie_content)
-
-    ydl_opts = {
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
-        "format": "best[ext=mp4]/best",
-        "quiet": True,
-        "no_warnings": True,
-        "cookiefile": cookie_path,
-        "http_headers": BROWSER_HEADERS,
-        "extractor_args": {"generic": {"impersonate": "chrome"}},
-    }
-
-    def _run_ytdlp():
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(share_url, download=True)
-                if info:
-                    filename = ydl.prepare_filename(info)
-                    if os.path.exists(filename):
-                        return filename
-                    # Check alternative extensions
-                    for ext in ("mp4", "mkv", "webm"):
-                        alt = os.path.splitext(filename)[0] + "." + ext
-                        if os.path.exists(alt):
-                            return alt
-                return None
-        except Exception as e:
-            logger.error(f"yt-dlp error: {e}")
+    direct_link = get_terabox_direct_link(share_url)
+    if not direct_link:
+        return None
+    try:
+        # Prepare the output filename and path
+        out_path = os.path.join(DOWNLOAD_DIR, f"{uuid.uuid4().hex}.mp4")
+        logger.info(f"Downloading from direct link: {direct_link[:80]}...")
+        # Stream the download with the same cookies and headers
+        cookies = None
+        if TERABOX_NDUS:
+            cookies = {"ndus": TERABOX_NDUS}
+        with requests.get(direct_link, stream=True, headers=BROWSER_HEADERS, cookies=cookies, timeout=300) as r:
+            r.raise_for_status()
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            logger.info(f"Download complete: {out_path}")
+            return out_path
+        else:
+            logger.error("Downloaded file is empty")
             return None
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        return None
 
-    loop = asyncio.get_event_loop()
-    file_path = await loop.run_in_executor(None, _run_ytdlp)
-    if file_path and os.path.exists(file_path) and os.path.getsize(file_path) > 1024:
-        logger.info(f"Download successful: {file_path}")
-        return file_path
-    return None
-
-# ══════════════════════════════════════════════════════════════════
+# -----------------------------------------------------------------
 # SECTION 3: AD SYSTEM (SHRINKFORGE – OPTIONAL)
-# ══════════════════════════════════════════════════════════════════
-
+# -----------------------------------------------------------------
 def generate_verify_token(user_id: int) -> str:
     token = uuid.uuid4().hex[:16].upper()
     pending_tokens[token] = {"user_id": user_id, "expires": time.time() + 3600}
@@ -239,10 +253,9 @@ async def create_ad_link(deep_link: str) -> str:
         logger.error(f"ShrinkForge error: {e}")
     return deep_link
 
-# ══════════════════════════════════════════════════════════════════
+# -----------------------------------------------------------------
 # SECTION 4: LOG CHANNEL
-# ══════════════════════════════════════════════════════════════════
-
+# -----------------------------------------------------------------
 async def log_to_channel(context: ContextTypes.DEFAULT_TYPE, user, message_text: str, bot_reply: str):
     try:
         user_info = f"👤 {user.full_name} (@{user.username or 'no_username'}) [ID: {user.id}]"
@@ -251,17 +264,15 @@ async def log_to_channel(context: ContextTypes.DEFAULT_TYPE, user, message_text:
     except Exception as e:
         logger.warning(f"Log channel error: {e}")
 
-# ══════════════════════════════════════════════════════════════════
+# -----------------------------------------------------------------
 # SECTION 5: TELEGRAM HANDLERS
-# ══════════════════════════════════════════════════════════════════
-
+# -----------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
     log_user(user_id)
     args = context.args
 
-    # Handle ad verification deep link
     if args and args[0].startswith("verify_"):
         parts = args[0].split("_")
         if len(parts) >= 3:
@@ -278,7 +289,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("❌ Invalid or expired token.")
         return
 
-    # Normal start
     status = get_user_status(user_id)
     welcome = (
         f"👋 Welcome, *{user.first_name}*!\n\n"
@@ -313,7 +323,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status = get_user_status(user_id)
     if not status["can_download"]:
-        # User reached free limit → show ad button
         token = generate_verify_token(user_id)
         deep_link = f"https://t.me/{BOT_USERNAME}?start=verify_{token}_{user_id}"
         ad_link = await create_ad_link(deep_link)
@@ -331,7 +340,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await log_to_channel(context, user, text, "Limit reached — ad link sent")
         return
 
-    # Free download available
     processing_msg = await update.message.reply_text("⬇️ *Downloading your video...* ⏳", parse_mode="Markdown")
     file_path = None
     try:
@@ -379,10 +387,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Unhandled error: {context.error}", exc_info=context.error)
 
-# ══════════════════════════════════════════════════════════════════
-# SECTION 6: KEEP-ALIVE WEB SERVER
-# ══════════════════════════════════════════════════════════════════
-
+# -----------------------------------------------------------------
+# SECTION 6: KEEP-ALIVE WEB SERVER (prevents Render idle)
+# -----------------------------------------------------------------
 class KeepAliveHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -396,10 +403,9 @@ def run_keep_alive():
     server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
     server.serve_forever()
 
-# ══════════════════════════════════════════════════════════════════
+# -----------------------------------------------------------------
 # SECTION 7: MAIN
-# ══════════════════════════════════════════════════════════════════
-
+# -----------------------------------------------------------------
 def main():
     if not BOT_TOKEN or not TERABOX_NDUS:
         logger.error("BOT_TOKEN or TERABOX_NDUS not set!")
